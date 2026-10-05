@@ -28,3 +28,36 @@ Inference C SDK 是一个面向可复用推理基础能力的 C11 库。它提�
 ## 文档
 
 构建选项和示例请参阅 [README.md](README.md)、[build.md](build.md) 和 [run_sdk.md](run_sdk.md)。
+
+---
+
+# Inference C SDK Features
+
+Inference C SDK is a C11 library for reusable inference building blocks. It provides common components for tensor operations, model input processing, and performance measurement. Model architectures and application logic remain the responsibility of the projects that use the SDK.
+
+## Core capabilities
+
+- **C11 public API**: Access tensor, attention, storage, tokenization, image processing, and benchmarking interfaces through the headers in `include/`.
+- **Multiple compute backends**: The default build uses portable C implementations and backend stubs. Select the CPU, Apple Metal, or NVIDIA CUDA backend for the target platform.
+- **Tensor and attention operations**: Includes general tensor operations and attention implementations, with GPU kernels available through the corresponding platform backends.
+- **Quantized linear layers**: The Metal and CUDA backends support GGML-compatible Q4_0 and Q8_0 weight-only linear operations with FP16 activations. Tensors must reside on the device for these operations; there is no CPU fallback.
+- **Model input processing**: The default image decoder and tokenizer are implemented in C. Optional Rust implementations provide image decoding and Hugging Face tokenization.
+- **Benchmarking API**: Configure warmup and measured iterations, device synchronization, and clock callbacks for custom workloads. Generate JSON or text reports with latency and throughput metrics.
+
+## Build and integration
+
+- **CMake integration**: Include the SDK with `add_subdirectory()` and link against `InferenceSDK::InferenceSDK`.
+- **Optional components**: Enable the ggml adapter or the mimalloc static allocator when needed.
+- **Metal library handling**: Metal libraries are generated during the build. Rust builds can embed them in the static library; non-Rust builds can use environment variables to specify their paths.
+- **Model examples**: The repository includes examples and tools, including SmolVLM, that demonstrate SDK components in model workloads. These examples are not a generic model architecture API.
+
+## Platform requirements
+
+- **CPU**: Uses the default portable C implementation.
+- **Metal**: Requires macOS, the Xcode Metal toolchain, and the Metal frameworks.
+- **CUDA**: Requires Linux, the CUDA Toolkit, and CMake's CUDAToolkit package.
+- **Optional Rust path**: Requires Rust/Cargo; Cargo may need to download pinned dependencies.
+
+## Documentation
+
+See [README.md](README.md), [build.md](build.md), and [run_sdk.md](run_sdk.md) for build options and usage examples.
