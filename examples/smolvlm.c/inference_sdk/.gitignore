@@ -1,0 +1,3 @@
+/build/
+/cmake-build-*/
+/rust_decoder/target/

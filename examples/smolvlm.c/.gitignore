@@ -1,0 +1,5 @@
+/build/
+/target/
+**/target/
+.DS_Store
+tests/sample-model/model.safetensors
