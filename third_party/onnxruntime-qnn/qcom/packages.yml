@@ -1,0 +1,220 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: MIT
+android_commandlinetools_linux_x86_64:
+  version: 13114758
+  url: https://dl.google.com/android/repository/commandlinetools-linux-{version}_latest.zip
+  sha256: 7ec965280a073311c339e571cd5de778b9975026cfcbe79f2b1cdcb1e15317ee
+  content_root: cmdline-tools
+  bindir: bin
+android_commandlinetools_windows_x86_64:
+  version: 13114758
+  url: https://dl.google.com/android/repository/commandlinetools-win-{version}_latest.zip
+  sha256: 98b565cb657b012dae6794cefc0f66ae1efb4690c699b78a614b4a6a3505b003
+  content_root: cmdline-tools
+  bindir: bin
+ccache_linux_aarch64:
+  version: 4.12
+  url: https://github.com/ccache/ccache/releases/download/v{version}/ccache-{version}-linux-aarch64.tar.xz
+  sha256: 378ed4b9f645f5aab691447e4ec45b4c68508a424ac37c9be7baa28ded385791
+  content_root: ccache-{version}-linux-aarch64
+ccache_linux_x86_64:
+  version: 4.12
+  url: https://github.com/ccache/ccache/releases/download/v{version}/ccache-{version}-linux-x86_64.tar.xz
+  sha256: d77e140d0403175b93f979f0b0d36e821bf31728b282f4bfda939f65836bcabe
+  content_root: ccache-{version}-linux-x86_64
+ccache_macos:
+  version: 4.12
+  url: https://github.com/ccache/ccache/releases/download/v{version}/ccache-{version}-darwin.tar.gz
+  sha256: 95cb03de0f2e0edb264d2443f2fe4500a13086689cc9ecd1095eb274dd8d9aee
+  content_root: ccache-{version}-darwin
+ccache_windows_arm64:
+  version: 4.12
+  url: https://github.com/ccache/ccache/releases/download/v{version}/ccache-{version}-windows-aarch64.zip
+  sha256: 12d8a95507ce19bb90cff49faa5f5de07919d5d8d91f129bcf597dbc30d0c250
+  content_root: ccache-{version}-windows-aarch64
+ccache_windows_x86_64:
+  version: 4.12
+  url: https://github.com/ccache/ccache/releases/download/v{version}/ccache-{version}-windows-x86_64.zip
+  sha256: 85c963b154dcf5e38dc6839d660218433a3b0b86387c302675d236e17ae7220d
+  content_root: ccache-{version}-windows-x86_64
+cmake_linux_aarch64:
+  version: 4.2.0
+  url: https://github.com/Kitware/CMake/releases/download/v{version}/cmake-{version}-linux-aarch64.tar.gz
+  sha256: 86f52e9769cd7745e5227931e689e122dc1afc5648cc9b04db601b165f3ac993
+  content_root: cmake-{version}-linux-aarch64
+  bindir: bin
+cmake_linux_x86_64:
+  version: 4.2.0
+  url: https://github.com/Kitware/CMake/releases/download/v{version}/cmake-{version}-linux-x86_64.tar.gz
+  sha256: bbcebd4c433eab3af03a8c80bb5d84e8dfc3ff8a4ab9d01547b21240c23f7c2c
+  content_root: cmake-{version}-linux-x86_64
+  bindir: bin
+cmake_macos:
+  version: 4.2.0
+  url: https://github.com/Kitware/CMake/releases/download/v{version}/cmake-{version}-macos-universal.tar.gz
+  sha256: b8b040a06343b2b6bc090b03a9c2bb4e98037518846989fb7c40ebbf30655c5d
+  content_root: cmake-{version}-macos-universal/CMake.app/Contents
+  bindir: bin
+cmake_windows_arm64:
+  version: 4.2.0
+  url: https://github.com/Kitware/CMake/releases/download/v{version}/cmake-{version}-windows-arm64.zip
+  sha256: 9eb3e88083dda569a4086c48517f5d49bd7b505dada79075ea7cb6e2ac6e0a1e
+  content_root: cmake-{version}-windows-arm64
+  bindir: bin
+cmake_windows_x86_64:
+  version: 4.2.0
+  url: https://github.com/Kitware/CMake/releases/download/v{version}/cmake-{version}-windows-x86_64.zip
+  sha256: cf35a516c4f5f4646b301e51c8e24b168cc012c3b1453b8f675303b54eb0ef45
+  content_root: cmake-{version}-windows-x86_64
+  bindir: bin
+hexagon_linux_x86_64:
+  version: 6.5.0.0
+  url: https://softwarecenter.qualcomm.com/api/download/software/sdks/Hexagon_SDK/Linux/Debian/6.5.0.0/Hexagon_SDK_Linux.zip
+  sha256: 668626f75c38ce1ca993768953db9bf4b632753c3e32ed8363a8287e3aaffc9a
+  content_root: Hexagon_SDK
+lcov_linux_x86_64:
+  version: 1.16
+  url: https://github.com/linux-test-project/lcov/releases/download/v{version}/lcov-{version}.tar.gz
+  sha256: 987031ad5528c8a746d4b52b380bc1bffe412de1f2b9c2ba5224995668e3240b
+  content_root: lcov-{version}
+  bindir: bin
+linux_oe_gcc112_toolchain:
+  # This package comes from AI Hub, which in turn copies it from the QAIRT build.
+  version: 20250402d
+  url: http://ort-ep-win-01.na.qualcomm.com:8000/linux-oe-aarch64-gcc11.2-toolchain/linux-oe-aarch64-gcc11.2-toolchain-1-universal-{version}.tar.gz
+  sha256: 1031825247827ad60189323aa5530490deae61547f4d9794ef9e0645e9207266
+java_linux_x86_64: &java_linux_common
+  major_version: 21
+  version: 21.0.5
+  url: https://download.oracle.com/java/{major_version}/archive/jdk-{version}_linux-x64_bin.tar.gz
+  sha256: 9c2f7c39e0d5b296ce50e563740694b2ebfe4a620415d1b2b848ba47bebceb47
+  content_root: jdk-{version}
+  bindir: bin
+java17_linux_x86_64:
+  <<: *java_linux_common
+  major_version: 17
+  version: 17.0.12
+  sha256: 311f1448312ecab391fe2a1b2ac140d6e1c7aea6fbf08416b466a58874f2b40f
+java_macos:
+  major_version: 21
+  version: 21.0.5
+  url: https://download.oracle.com/java/{major_version}/archive/jdk-{version}_macos-aarch64_bin.tar.gz
+  sha256: 13cb8d754069fc76a2ff6eee96273cc1a96cb47ecf3afa7820407635c386dd37
+  content_root: jdk-{version}.jdk/Contents/Home
+  bindir: bin
+java_windows_x86_64:
+  major_version: 21
+  version: 21.0.5
+  url: https://download.oracle.com/java/{major_version}/archive/jdk-{version}_windows-x64_bin.zip
+  sha256: 6cce98ce38b86737c63912fd1df9ecfee1fe209ab08c0e1e16500f054e67de48
+  content_root: jdk-{version}
+  bindir: bin
+llvm_linux_x86_64:
+  version: 21.1.8
+  url: https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.8/LLVM-21.1.8-Linux-X64.tar.xz
+  sha256: b3b7f2801d15d50736acea3c73982994d025b01c2f035b91ae3b49d1b575732b
+  content_root: LLVM-{version}-Linux-X64
+  bindir: bin
+maven_linux_x86_64:
+  version: 3.9.8
+  url: https://archive.apache.org/dist/maven/maven-3/{version}/binaries/apache-maven-{version}-bin.tar.gz
+  sha256: 067672629075b740e3d0a928e21021dd615a53287af36d4ccca44e87e081d102
+  content_root: apache-maven-{version}
+  bindir: bin
+model_zoo:
+  version: 2026-04-03
+  url: http://ort-ep-win-01.na.qualcomm.com:8000/model-zoo/model-zoo-{version}.zip
+  sha256: 3a870c41c7b1aa8e8e2d7f2fd6dcc6c47de73da57ca3dc26b4f37d436c05a29e
+  content_root: model-zoo
+ninja_linux_aarch64:
+  version: 1.12.1
+  url: https://github.com/ninja-build/ninja/releases/download/v{version}/ninja-linux-aarch64.zip
+  sha256: 5c25c6570b0155e95fce5918cb95f1ad9870df5768653afe128db822301a05a1
+ninja_linux_x86_64:
+  version: 1.12.1
+  url: https://github.com/ninja-build/ninja/releases/download/v{version}/ninja-linux.zip
+  sha256: 6f98805688d19672bd699fbbfa2c2cf0fc054ac3df1f0e6a47664d963d530255
+ninja_macos:
+  version: 1.12.1
+  url: https://github.com/ninja-build/ninja/releases/download/v{version}/ninja-mac.zip
+  sha256: 89a287444b5b3e98f88a945afa50ce937b8ffd1dcc59c555ad9b1baf855298c9
+ninja_windows_x86_64:
+  version: 1.12.1
+  url: https://github.com/ninja-build/ninja/releases/download/v{version}/ninja-win.zip
+  sha256: f550fec705b6d6ff58f2db3c374c2277a37691678d6aba463adcbb129108467a
+nuget_windows_x86_64:
+  version: 7.0.1
+  url: https://dist.nuget.org/win-x86-commandline/v{version}/nuget.exe
+  md5: c51179f8b404bbf7f7b8e457240cc09d
+  is_installer: false
+onnx_models:
+  version: 2025-10-02
+  url: http://ort-ep-win-01.na.qualcomm.com:8000/onnx-models/onnx-models-{version}.tar.gz
+  sha256: 5c877a633970248e181018ccdabb280cec22e1b113f3068b6585d3f55cac3fb2
+  content_root: onnx-models-{version}
+ort_prebuilt_windows_x64: &ort_prebuilt_common
+  version: 1.29.0
+  url: https://github.com/microsoft/onnxruntime/releases/download/v{version}/onnxruntime-win-x64-{version}.zip
+  sha256: c9b4b7086b529ad814f428c1bad028e20a25d7dc0699836775faace4ab5b78b2
+  content_root: onnxruntime-win-x64-{version}
+ort_prebuilt_windows_arm64:
+  <<: *ort_prebuilt_common
+  url: https://github.com/microsoft/onnxruntime/releases/download/v{version}/onnxruntime-win-arm64-{version}.zip
+  sha256: a094a49c3ced0f9fca554647cc7566ae99d93a63a8ce6bf47975561c2de7608e
+  content_root: onnxruntime-win-arm64-{version}
+ort_prebuilt_linux_x64:
+  <<: *ort_prebuilt_common
+  url: https://github.com/microsoft/onnxruntime/releases/download/v{version}/onnxruntime-linux-x64-{version}.tgz
+  sha256: c3fddc4f139a045b0c4902c57410f0694f1c2fdf9b6939fbe38b1aeae7cd14ba
+  content_root: onnxruntime-linux-x64-{version}
+ort_prebuilt_linux_aarch64:
+  <<: *ort_prebuilt_common
+  url: https://github.com/microsoft/onnxruntime/releases/download/v{version}/onnxruntime-linux-aarch64-{version}.tgz
+  sha256: e1799098ebc054b370f6176a450f158720f297818c613e5dc99b92e2ec82346f
+  content_root: onnxruntime-linux-aarch64-{version}
+python_311_windows_x86_64: &py_x86_64_common
+  version: 3.11.9
+  url: https://www.python.org/ftp/python/{version}/python-{version}-amd64.exe
+  md5: e8dcd502e34932eebcaf1be056d5cbcd
+  install_args: [/quiet, InstallAllUsers=0, "TargetDir={root_dir}", Include_doc=0, Include_launcher=0, Include_tcltk=0, Include_test=0, Shortcuts=0]
+  repair_args: [/quiet, /repair]
+  uninstall_args: [/quiet, /uninstall]
+python_312_windows_x86_64:
+  <<: *py_x86_64_common
+  version: 3.12.10
+  md5: 5eddb0b6f12c852725de071ae681dde4
+python_313_windows_x86_64:
+  <<: *py_x86_64_common
+  version: 3.13.7
+  md5: 1da92e43c79f3d1539dd23a3c14bf3f0
+python_314_windows_x86_64:
+  <<: *py_x86_64_common
+  version: 3.14.3
+  md5: 897f5296196cddf98ea8c0409c299753
+python_311_windows_arm64: &py_arm64_common
+  <<: *py_x86_64_common
+  version: 3.11.9
+  url: https://www.python.org/ftp/python/{version}/python-{version}-arm64.exe
+  md5: 328d93f71cb078965e4cfa2eb2663fa1
+python_312_windows_arm64:
+  <<: *py_arm64_common
+  version: 3.12.10
+  md5: 37df52717faa6c514342b8d43cae7026
+python_313_windows_arm64:
+  <<: *py_arm64_common
+  version: 3.13.7
+  md5: 66c0ba98b20b7d4ea0904223d484d369
+python_314_windows_arm64:
+  <<: *py_arm64_common
+  version: 3.14.3
+  md5: 1183951d055ef6c0ae1fb686b3342a6f
+qairt:
+  version: 2.51.0.260929
+  url: https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/{version}/v{version}.zip
+  sha256: 9b4ca798902f02a2543857f5de4d233830c044d19701b92fc66a12fdc292211f
+  content_root: qairt/{version}
+  bindir: bin
+qualcomm_device_cloud_sdk:
+  version: 0.4.1
+  url: https://softwarecenter.qualcomm.com/api/download/software/tools/Qualcomm_Device_Cloud_SDK/All/{version}/qualcomm_device_cloud_sdk-{version}.zip
+  sha256: 716a862ce64f9146078cd0b7b7ab18d2672520e068345accbb094e848cc22cfb

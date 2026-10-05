@@ -1,0 +1,868 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#if !defined(ORT_MINIMAL_BUILD)
+
+#include <filesystem>
+#include <optional>
+#include <string>
+#include <unordered_map>
+
+#include "test/providers/qnn/qnn_node_group/qnn_graph_checker.h"
+#include "test/providers/qnn/qnn_test_utils.h"
+#include "test/unittest_util/qdq_test_utils.h"
+
+#include "gtest/gtest.h"
+
+namespace onnxruntime {
+namespace test {
+
+/**
+ * Creates a graph with a single Resize operator.
+ *
+ * \param shape The shape of the input and output. Input data is randomly generated with this shape.
+ * \param sizes_data The sizes input which determines the output shape.
+ * \param mode The resize mode (e.g., nearest, linear).
+ * \param coordinate_transformation_mode The coordinate transformation mode (e.g., half_pixel, pytorch_half_pixel).
+ * \param nearest_mode The rounding for "nearest" mode (e.g., round_prefer_floor, floor).
+ *
+ * \return A function that builds the graph with the provided builder.
+ */
+static GetTestModelFn GetResizeModelBuilder(const TestInputDef<float>& input_def,
+                                            const std::vector<int64_t>& sizes_data,
+                                            const std::string& mode = "nearest",
+                                            const std::string& coordinate_transformation_mode = "half_pixel",
+                                            const std::string& nearest_mode = "round_prefer_floor",
+                                            std::optional<float> cubic_coeff_a = std::nullopt) {
+  return [input_def, sizes_data, mode, coordinate_transformation_mode, nearest_mode, cubic_coeff_a](ModelTestBuilder& builder) {
+    MakeTestInput<float>(builder, "input", input_def);
+
+    builder.MakeInitializer<float>("roi", {0}, {});
+    builder.MakeInitializer<float>("scales", {0}, {});
+    builder.Make1DInitializer<int64_t>("sizes", sizes_data);
+
+    std::vector<ONNX_NAMESPACE::AttributeProto> attrs;
+    attrs.reserve(mode == "nearest" ? 3u : 2u);
+
+    attrs.push_back(MakeAttribute("mode", mode));
+    attrs.push_back(MakeAttribute("coordinate_transformation_mode", coordinate_transformation_mode));
+    if (mode == "nearest") {
+      attrs.push_back(MakeAttribute("nearest_mode", nearest_mode));
+    }
+
+    if (mode == "cubic" && cubic_coeff_a.has_value()) {
+      attrs.push_back(MakeAttribute("cubic_coeff_a", *cubic_coeff_a));
+    }
+    builder.MakeOutput("Y");
+    builder.AddNode("Resize",
+                    "Resize",
+                    {"input", "roi", "scales", "sizes"},
+                    {"Y"},
+                    kOnnxDomain,
+                    attrs);
+  };
+}
+
+static GetTestModelFn GetResizeModelBuilderWithScales(const TestInputDef<float>& input_def,
+                                                      const std::vector<float>& scales_data,
+                                                      const std::string& mode = "nearest",
+                                                      const std::string& coordinate_transformation_mode = "half_pixel",
+                                                      const std::string& nearest_mode = "round_prefer_floor",
+                                                      std::optional<float> cubic_coeff_a = std::nullopt) {
+  return [input_def, scales_data, mode, coordinate_transformation_mode, nearest_mode, cubic_coeff_a](ModelTestBuilder& builder) {
+    MakeTestInput<float>(builder, "input", input_def);
+
+    builder.MakeInitializer<float>("roi", {0}, {});
+    builder.Make1DInitializer<float>("scales", scales_data);
+
+    std::vector<ONNX_NAMESPACE::AttributeProto> attrs;
+    attrs.reserve(mode == "nearest" ? 3u : 2u);
+
+    attrs.push_back(MakeAttribute("mode", mode));
+    attrs.push_back(MakeAttribute("coordinate_transformation_mode", coordinate_transformation_mode));
+    if (mode == "nearest") {
+      attrs.push_back(MakeAttribute("nearest_mode", nearest_mode));
+    }
+
+    if (mode == "cubic" && cubic_coeff_a.has_value()) {
+      attrs.push_back(MakeAttribute("cubic_coeff_a", *cubic_coeff_a));
+    }
+    builder.MakeOutput("Y");
+    builder.AddNode("Resize",
+                    "Resize",
+                    {"input", "roi", "scales"},
+                    {"Y"},
+                    kOnnxDomain,
+                    attrs);
+  };
+}
+
+template <typename QuantType = uint8_t>
+static GetTestQDQModelFn<QuantType> GetQDQResizeModelBuilder(const TestInputDef<float>& input_def,
+                                                             const std::vector<int64_t>& sizes_data,
+                                                             const std::string& mode = "nearest",
+                                                             const std::string& coordinate_transformation_mode = "half_pixel",
+                                                             const std::string& nearest_mode = "round_prefer_floor",
+                                                             std::optional<float> cubic_coeff_a = std::nullopt) {
+  return [input_def, sizes_data, mode,
+          coordinate_transformation_mode, nearest_mode, cubic_coeff_a](ModelTestBuilder& builder,
+                                                                       std::vector<QuantParams<QuantType>>& output_qparams) {
+    MakeTestInput<float>(builder, "input", input_def);
+    const QuantParams<QuantType> input_qparams = GetTestInputQuantParams<QuantType>(input_def);
+
+    // input -> Q -> DQ ->
+    const std::string input_qdq =
+        AddQDQNodePair<QuantType>(builder, "qdq_in", "input", input_qparams.scale, input_qparams.zero_point);
+
+    builder.MakeInitializer<float>("roi", {0}, {});
+    builder.MakeInitializer<float>("scales", {0}, {});
+    builder.Make1DInitializer<int64_t>("sizes", sizes_data);
+
+    std::vector<ONNX_NAMESPACE::AttributeProto> attrs;
+    attrs.reserve(mode == "nearest" ? 3u : 2u);
+
+    attrs.push_back(MakeAttribute("mode", mode));
+    attrs.push_back(MakeAttribute("coordinate_transformation_mode", coordinate_transformation_mode));
+    if (mode == "nearest") {
+      attrs.push_back(MakeAttribute("nearest_mode", nearest_mode));
+    }
+
+    if (mode == "cubic" && cubic_coeff_a.has_value()) {
+      attrs.push_back(MakeAttribute("cubic_coeff_a", *cubic_coeff_a));
+    }
+    builder.AddNode("Resize",
+                    "Resize",
+                    {input_qdq, "roi", "scales", "sizes"},
+                    {"resize_out"},
+                    kOnnxDomain,
+                    attrs);
+
+    // Resize requires the output quantization parameters to match the input.
+    output_qparams[0] = input_qparams;
+
+    AddQDQNodePairWithOutputAsGraphOutput<QuantType>(builder, "qdq_out", "resize_out",
+                                                     output_qparams[0].scale, output_qparams[0].zero_point);
+  };
+}
+
+/**
+ * Runs a Resize model on the QNN CPU backend. Checks the graph node assignment, and that inference
+ * outputs for QNN and CPU match.
+ *
+ * \param input_def The input definition (shape, data, etc).
+ * \param sizes_data The sizes input which determines the output shape.
+ * \param mode The resize mode (e.g., nearest, linear).
+ * \param coordinate_transformation_mode The coordinate transformation mode (e.g., half_pixel, pytorch_half_pixel).
+ * \param nearest_mode The rounding for "nearest" mode (e.g., round_prefer_floor, floor).
+ * \param expected_ep_assignment How many nodes are expected to be assigned to QNN (All, Some, or None).
+ * \param opset The opset version to use.
+ */
+static void RunCPUResizeOpTest(const TestInputDef<float>& input_def, const std::vector<int64_t>& sizes_data,
+                               const std::string& mode, const std::string& coordinate_transformation_mode,
+                               const std::string& nearest_mode,
+                               ExpectedEPNodeAssignment expected_ep_assignment,
+                               int opset = 19,
+                               std::optional<float> cubic_coeff_a = std::nullopt) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "cpu";
+  provider_options["offload_graph_io_quantization"] = "0";
+
+  RunQnnModelTest(GetResizeModelBuilder(input_def, sizes_data, mode, coordinate_transformation_mode,
+                                        nearest_mode, cubic_coeff_a),
+                  provider_options,
+                  opset,
+                  EPVerificationParams{expected_ep_assignment});
+}
+
+static void RunCPUResizeOpTestWithScales(const TestInputDef<float>& input_def, const std::vector<float>& scales_data,
+                                         const std::string& mode, const std::string& coordinate_transformation_mode,
+                                         const std::string& nearest_mode,
+                                         ExpectedEPNodeAssignment expected_ep_assignment,
+                                         int opset = 19,
+                                         std::optional<float> cubic_coeff_a = std::nullopt) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "cpu";
+  provider_options["offload_graph_io_quantization"] = "0";
+
+  RunQnnModelTest(GetResizeModelBuilderWithScales(input_def, scales_data, mode, coordinate_transformation_mode,
+                                                  nearest_mode, cubic_coeff_a),
+                  provider_options,
+                  opset,
+                  EPVerificationParams{expected_ep_assignment});
+}
+
+template <typename QuantType>
+static void RunQDQResizeOpTest(const TestInputDef<float>& input_def,
+                               const std::vector<int64_t>& sizes_data,
+                               const std::string& mode, const std::string& coordinate_transformation_mode,
+                               const std::string& nearest_mode,
+                               ExpectedEPNodeAssignment expected_ep_assignment,
+                               int opset = 19,
+                               QDQTolerance tolerance = QDQTolerance(),
+                               const std::unordered_map<std::string, std::string>& session_option_pairs = {},
+                               std::optional<GraphOptimizationLevel> graph_optimization_level = std::nullopt,
+                               std::optional<float> cubic_coeff_a = std::nullopt) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+
+  TestQDQModelAccuracy(GetResizeModelBuilder(input_def, sizes_data, mode, coordinate_transformation_mode,
+                                             nearest_mode, cubic_coeff_a),
+                       GetQDQResizeModelBuilder<QuantType>(input_def, sizes_data, mode, coordinate_transformation_mode,
+                                                           nearest_mode, cubic_coeff_a),
+                       provider_options,
+                       opset,
+                       expected_ep_assignment,
+                       tolerance,
+                       OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR,
+                       "",
+                       session_option_pairs,
+                       graph_optimization_level);
+}
+
+//
+// CPU tests (all map to QNN's Resize on CPU):
+//
+
+// Upsample that uses "round_prefer_floor" as the "nearest_mode".
+// coordinate_transformation_mode: "half_pixel"
+TEST_F(QnnCPUBackendTests, ResizeUpsampleNearestHalfPixel_rpf) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 70);
+  RunCPUResizeOpTest(TestInputDef<float>({1, 2, 7, 5}, false, input_data),
+                     {1, 2, 21, 10},  // Sizes
+                     "nearest",
+                     "half_pixel",
+                     "round_prefer_floor",
+                     ExpectedEPNodeAssignment::All);
+}
+
+// Upsample that uses "round_prefer_ceil" as the "nearest_mode".
+// coordinate_transformation_mode: "half_pixel"
+TEST_F(QnnCPUBackendTests, ResizeUpsampleNearestHalfPixel_rpc) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 8);
+  RunCPUResizeOpTest(TestInputDef<float>({1, 1, 2, 4}, false, input_data),
+                     {1, 1, 7, 5}, "nearest", "half_pixel", "round_prefer_ceil",
+                     ExpectedEPNodeAssignment::All);
+}
+
+// Downsample that uses "round_prefer_ceil" as the "nearest_mode".
+// coordinate_transformation_mode: "half_pixel"
+TEST_F(QnnCPUBackendTests, ResizeDownsampleNearestHalfPixel_rpc) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 8);
+  RunCPUResizeOpTest(TestInputDef<float>({1, 1, 2, 4}, false, input_data),
+                     {1, 1, 1, 3}, "nearest", "half_pixel", "round_prefer_ceil",
+                     ExpectedEPNodeAssignment::All);
+}
+
+// Downsample that uses "round_prefer_floor" as the "nearest_mode".
+// coordinate_transformation_mode: "half_pixel"
+TEST_F(QnnCPUBackendTests, ResizeDownsampleNearestHalfPixel_rpf) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 8);
+  RunCPUResizeOpTest(TestInputDef<float>({1, 1, 2, 4}, false, input_data),
+                     {1, 1, 1, 2}, "nearest", "half_pixel", "round_prefer_ceil",
+                     ExpectedEPNodeAssignment::All);
+}
+
+// Upsample that uses "round_prefer_floor" as the "nearest_mode".
+// coordinate_transformation_mode: "align_corners"
+TEST_F(QnnCPUBackendTests, ResizeUpsampleNearestAlignCorners_rpf) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 70);
+  RunCPUResizeOpTest(TestInputDef<float>({1, 2, 7, 5}, false, input_data),
+                     {1, 2, 21, 10}, "nearest", "align_corners", "round_prefer_floor",
+                     ExpectedEPNodeAssignment::All);
+}
+
+// Upsample that uses "round_prefer_floor" as the "nearest_mode".
+// coordinate_transformation_mode: "asymmetric"
+TEST_F(QnnCPUBackendTests, ResizeUpsampleNearestAsymmetric_rpf) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 70);
+  RunCPUResizeOpTest(TestInputDef<float>({1, 2, 7, 5}, false, input_data),
+                     {1, 2, 21, 10}, "nearest", "asymmetric", "round_prefer_floor",
+                     ExpectedEPNodeAssignment::All);
+}
+
+// Upsample that uses "round_prefer_ceil" as the "nearest_mode".
+// coordinate_transformation_mode: "align_corners"
+TEST_F(QnnCPUBackendTests, ResizeUpsampleNearestAlignCorners_rpc) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 8);
+  RunCPUResizeOpTest(TestInputDef<float>({1, 1, 2, 4}, false, input_data),
+                     {1, 1, 7, 5}, "nearest", "align_corners", "round_prefer_ceil",
+                     ExpectedEPNodeAssignment::All);
+}
+
+// Downsample that uses "round_prefer_ceil" as the "nearest_mode".
+// coordinate_transformation_mode: "align_corners"
+TEST_F(QnnCPUBackendTests, ResizeDownsampleNearestAlignCorners_rpc) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 8);
+  RunCPUResizeOpTest(TestInputDef<float>({1, 1, 2, 4}, false, input_data),
+                     {1, 1, 1, 3}, "nearest", "align_corners", "round_prefer_ceil",
+                     ExpectedEPNodeAssignment::All);
+}
+
+// Downsample that uses "round_prefer_floor" as the "nearest_mode".
+// coordinate_transformation_mode: "align_corners"
+TEST_F(QnnCPUBackendTests, ResizeDownsampleNearestAlignCorners_rpf) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 8);
+  RunCPUResizeOpTest(TestInputDef<float>({1, 1, 2, 4}, false, input_data),
+                     {1, 1, 1, 2}, "nearest", "align_corners", "round_prefer_floor",
+                     ExpectedEPNodeAssignment::All);
+}
+
+//
+// Cpu tests that use the "linear" mode.
+//
+
+TEST_F(QnnCPUBackendTests, Resize2xLinearHalfPixel) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 60);
+  RunCPUResizeOpTest(TestInputDef<float>({1, 3, 4, 5}, false, input_data),
+                     {1, 3, 8, 10}, "linear", "half_pixel", "",
+                     ExpectedEPNodeAssignment::All);
+}
+
+TEST_F(QnnCPUBackendTests, Resize2xLinearHalfPixel_scales) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 60);
+  RunCPUResizeOpTestWithScales(TestInputDef<float>({1, 3, 4, 5}, false, input_data),
+                               {1.0f, 1.0f, 2.0f, 2.0f}, "linear", "half_pixel", "",
+                               ExpectedEPNodeAssignment::All);
+}
+
+TEST_F(QnnCPUBackendTests, Resize2xLinearAlignCorners) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 60);
+  RunCPUResizeOpTest(TestInputDef<float>({1, 3, 4, 5}, false, input_data),
+                     {1, 3, 8, 10}, "linear", "align_corners", "",
+                     ExpectedEPNodeAssignment::All);
+}
+
+TEST_F(QnnCPUBackendTests, Resize2xLinearAlignCorners_scales) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 60);
+  RunCPUResizeOpTestWithScales(TestInputDef<float>({1, 3, 4, 5}, false, input_data),
+                               {1.0f, 1.0f, 2.0f, 2.0f}, "linear", "align_corners", "",
+                               ExpectedEPNodeAssignment::All);
+}
+
+TEST_F(QnnCPUBackendTests, Resize2xCubicHalfPixel) {
+  std::vector<float> input_data = GetFloatDataInRange(-5.0f, 5.0f, 60);
+  RunCPUResizeOpTest(TestInputDef<float>({1, 3, 4, 5}, false, input_data),
+                     {1, 3, 8, 10}, "cubic", "half_pixel", "",
+                     ExpectedEPNodeAssignment::All);
+}
+
+TEST_F(QnnCPUBackendTests, Resize2xCubicHalfPixel_CustomCoeff) {
+  std::vector<float> input_data = GetFloatDataInRange(-2.0f, 4.0f, 60);
+  const float cubic_coeff_a = -0.5f;
+  RunCPUResizeOpTest(TestInputDef<float>({1, 3, 4, 5}, false, input_data),
+                     {1, 3, 8, 10}, "cubic", "half_pixel", "",
+                     ExpectedEPNodeAssignment::All,
+                     19,
+                     cubic_coeff_a);
+}
+
+TEST_F(QnnCPUBackendTests, Resize2xCubicHalfPixel_scales_inverse) {
+  std::vector<float> input_data = GetFloatDataInRange(-5.0f, 5.0f, 60);
+  RunCPUResizeOpTestWithScales(TestInputDef<float>({1, 3, 4, 5}, false, input_data),
+                               {1.0f, 1.0f, 0.5f, 0.5f}, "cubic", "half_pixel", "",
+                               ExpectedEPNodeAssignment::None);
+}
+
+// Test Resize downsample with mode: "linear", coordinate_transformation_mode: "align_corners"
+TEST_F(QnnCPUBackendTests, Resize_DownSample_Linear_AlignCorners_scales) {
+  std::vector<float> input_data = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+  RunCPUResizeOpTestWithScales(TestInputDef<float>({1, 1, 2, 4}, false, input_data),
+                               {1.0f, 1.0f, 0.6f, 0.6f}, "linear", "align_corners", "",
+                               ExpectedEPNodeAssignment::All);
+}
+
+// Note: The QNN CPU backend does not define explicit scale attributes. It derives scale values
+// implicitly from the input and output tensor shapes. Therefore, the selected parameters must
+// ensure that the product of the input dimensions and the inferred scales evaluates to an integer.
+TEST_F(QnnCPUBackendTests, Resize_DownSample_Linear_HalfPixel_scales) {
+  std::vector<float> input_data = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+  RunCPUResizeOpTestWithScales(TestInputDef<float>({1, 1, 2, 4}, false, input_data),
+                               {1.0f, 1.0f, 0.5f, 0.5f}, "linear", "half_pixel", "",
+                               ExpectedEPNodeAssignment::All);
+}
+
+// Test CPU Resize mode: "nearest", coordinate_transformation_mode: "tf_half_pixel_for_nn",
+// nearest_mode: "floor". The CPU backend lowers via the same Resize(2x, ASYMMETRIC) + StridedSlice
+// decomposition as HTP (the tf dispatch is not gated on is_npu_backend).
+TEST_F(QnnCPUBackendTests, Resize2xNearestTfHalfPixelForNNFloor) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  RunCPUResizeOpTest(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                     {1, 3, 8, 8}, "nearest", "tf_half_pixel_for_nn", "floor",
+                     ExpectedEPNodeAssignment::All);
+}
+
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
+//
+// HTP tests:
+//
+
+// Test QDQ Resize downsample with mode: "linear", coordinate_transformation_mode: "align_corners"
+// Maps to QNN's ResizeBilinear operator.
+TEST_F(QnnHTPBackendTests, Resize_DownSample_Linear_AlignCorners) {
+  std::vector<float> input_data = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 1, 2, 4}, false, input_data),
+                              {1, 1, 1, 2}, "linear", "align_corners", "",
+                              ExpectedEPNodeAssignment::All);
+}
+
+// Test 2x QDQ Resize mode: "cubic", coordinate_transformation_mode: "half_pixel"
+// Maps to QNN's Resize operator with cubic interpolation.
+//
+// GraphOptimizationLevel::ORT_DISABLE_ALL is set in cubic unit tests to avoid the DQ->Resize->Q folding
+// that redirects execution to the float-only CPU ResizeBiCubic implementation.
+TEST_F(QnnHTPBackendTests, ResizeU8_2xCubicHalfPixel) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                              {1, 3, 8, 8}, "cubic", "half_pixel", "",
+                              ExpectedEPNodeAssignment::All,
+                              19,
+                              QDQTolerance(),
+                              {},
+                              GraphOptimizationLevel::ORT_DISABLE_ALL);
+}
+
+// Test 2x QDQ Resize mode: "cubic" with a custom cubic coefficient.
+TEST_F(QnnHTPBackendTests, ResizeU8_2xCubicHalfPixel_CustomCoeff) {
+  std::vector<float> input_data = GetFloatDataInRange(-5.0f, 5.0f, 48);
+  const float cubic_coeff_a = -0.6f;
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                              {1, 3, 8, 8}, "cubic", "half_pixel", "",
+                              ExpectedEPNodeAssignment::All,
+                              19,
+                              QDQTolerance(),
+                              {},
+                              GraphOptimizationLevel::ORT_DISABLE_ALL,
+                              cubic_coeff_a);
+}
+
+TEST_F(QnnHTPBackendTests, ResizeU8_2xCubicHalfPixelFloor_scales) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  const TestInputDef<float> input_def({1, 3, 4, 4}, false, input_data);
+  const std::vector<float> scales_data{1.0f, 1.0f, 2.0f, 2.0f};
+
+  auto float_builder = GetResizeModelBuilderWithScales(input_def, scales_data, "cubic", "half_pixel", "floor");
+
+  // Create a QDQ model builder that uses scales instead of sizes
+  GetTestQDQModelFn<uint8_t> qdq_builder =
+      [input_def, scales_data](ModelTestBuilder& builder,
+                               std::vector<QuantParams<uint8_t>>& output_qparams) {
+        MakeTestInput<float>(builder, "input", input_def);
+        const QuantParams<uint8_t> input_qparams = GetTestInputQuantParams<uint8_t>(input_def);
+
+        // input -> Q -> DQ ->
+        const std::string input_qdq =
+            AddQDQNodePair<uint8_t>(builder, "qdq_in", "input", input_qparams.scale, input_qparams.zero_point);
+
+        builder.MakeInitializer<float>("roi", {0}, {});
+        builder.Make1DInitializer<float>("scales", scales_data);
+
+        std::vector<ONNX_NAMESPACE::AttributeProto> attrs;
+        attrs.push_back(MakeAttribute("mode", "cubic"));
+        attrs.push_back(MakeAttribute("coordinate_transformation_mode", "half_pixel"));
+        attrs.push_back(MakeAttribute("nearest_mode", "floor"));
+
+        builder.AddNode("Resize",
+                        "Resize",
+                        {input_qdq, "roi", "scales"},
+                        {"resize_out"},
+                        kOnnxDomain,
+                        attrs);
+
+        // Resize requires the output quantization parameters to match the input.
+        output_qparams[0] = input_qparams;
+
+        AddQDQNodePairWithOutputAsGraphOutput<uint8_t>(builder, "qdq_out", "resize_out",
+                                                       output_qparams[0].scale, output_qparams[0].zero_point);
+      };
+
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+
+  TestQDQModelAccuracy(float_builder,
+                       qdq_builder,
+                       provider_options,
+                       19,
+                       ExpectedEPNodeAssignment::All,
+                       QDQTolerance(),
+                       OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR,
+                       "",
+                       {},
+                       GraphOptimizationLevel::ORT_DISABLE_ALL);
+}
+
+TEST_F(QnnHTPBackendTests, ResizeU8_2xCubicHalfPixel_scales_downsample) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  const TestInputDef<float> input_def({1, 3, 4, 4}, false, input_data);
+  const std::vector<float> scales_data{1.0f, 1.0f, 0.5f, 0.5f};
+
+  auto float_builder = GetResizeModelBuilderWithScales(input_def, scales_data, "cubic", "half_pixel", "floor");
+
+  // Create a QDQ model builder that uses scales instead of sizes
+  GetTestQDQModelFn<uint8_t> qdq_builder =
+      [input_def, scales_data](ModelTestBuilder& builder,
+                               std::vector<QuantParams<uint8_t>>& output_qparams) {
+        MakeTestInput<float>(builder, "input", input_def);
+        const QuantParams<uint8_t> input_qparams = GetTestInputQuantParams<uint8_t>(input_def);
+
+        // input -> Q -> DQ ->
+        const std::string input_qdq =
+            AddQDQNodePair<uint8_t>(builder, "qdq_in", "input", input_qparams.scale, input_qparams.zero_point);
+
+        builder.MakeInitializer<float>("roi", {0}, {});
+        builder.Make1DInitializer<float>("scales", scales_data);
+
+        std::vector<ONNX_NAMESPACE::AttributeProto> attrs;
+        attrs.push_back(MakeAttribute("mode", "cubic"));
+        attrs.push_back(MakeAttribute("coordinate_transformation_mode", "half_pixel"));
+        attrs.push_back(MakeAttribute("nearest_mode", "floor"));
+
+        builder.AddNode("Resize",
+                        "Resize",
+                        {input_qdq, "roi", "scales"},
+                        {"resize_out"},
+                        kOnnxDomain,
+                        attrs);
+
+        // Resize requires the output quantization parameters to match the input.
+        output_qparams[0] = input_qparams;
+
+        AddQDQNodePairWithOutputAsGraphOutput<uint8_t>(builder, "qdq_out", "resize_out",
+                                                       output_qparams[0].scale, output_qparams[0].zero_point);
+      };
+
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+
+  TestQDQModelAccuracy(float_builder,
+                       qdq_builder,
+                       provider_options,
+                       19,
+                       ExpectedEPNodeAssignment::All,
+                       QDQTolerance(),
+                       OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR,
+                       "",
+                       {},
+                       GraphOptimizationLevel::ORT_DISABLE_ALL);
+}
+
+// Test QDQ Resize downsample with mode: "linear", coordinate_transformation_mode: "half_pixel"
+// Maps to QNN's ResizeBilinear operator.
+TEST_F(QnnHTPBackendTests, Resize_DownSample_Linear_HalfPixel) {
+  std::vector<float> input_data = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 1, 2, 4}, false, input_data),
+                              {1, 1, 1, 2}, "linear", "half_pixel", "",
+                              ExpectedEPNodeAssignment::All,
+                              19);
+}
+
+// Test 2x QDQ Resize mode: "linear", coordinate_transformation_mode: "pytorch_half_pixel"
+// Maps to QNN's ResizeBilinear operator (output spatial dims > 1, equivalent to half_pixel).
+TEST_F(QnnHTPBackendTests, ResizeU8_2xLinearPytorchHalfPixel) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                              {1, 3, 8, 8}, "linear", "pytorch_half_pixel", "",
+                              ExpectedEPNodeAssignment::All,
+                              19);
+}
+
+// Runs a QDQ Resize (linear, opset 19) on HTP and asserts the lowered QNN graph
+// contains exactly `expected_count` instances of `expected_qnn_op` and zero of
+// `forbidden_qnn_op`. Used to lock both exits of the
+// IsPyTorchHalfPixelEquivalentToHalfPixel predicate.
+//
+// Note on the IsSkipped() guard: TestQDQModelAccuracy invokes GTEST_SKIP on HTP
+// arch <= 68 (e.g., QCS6490) where the bilinear path is not exercised; in that
+// case no QNN graph JSON is written and AssertOpInQnnGraph would fail spuriously.
+static void RunQDQResizeAndAssertQnnOp(const std::vector<int64_t>& input_shape,
+                                       const std::vector<int64_t>& output_shape,
+                                       const std::string& transformation_mode,
+                                       const std::string& expected_qnn_op,
+                                       const std::string& forbidden_qnn_op,
+                                       const std::string& dump_dir_name) {
+  namespace fs = std::filesystem;
+  const fs::path graph_dir = fs::temp_directory_path() / dump_dir_name;
+
+  int64_t num_elements = 1;
+  for (int64_t d : input_shape) num_elements *= d;
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, static_cast<size_t>(num_elements));
+
+  // Run without graph dump first to check if the test should be skipped on this device
+  // (e.g., QCS6490 / HTP arch <= 68 where ResizeBilinear is not exercised).
+  // Filesystem operations (create_directories, dump_json_qnn_graph) must not be
+  // attempted on devices that skip this test, as they can crash the test process
+  // before producing any output (NoLogs failure on QDC).
+  {
+    ProviderOptions probe_options;
+    probe_options["backend_type"] = "htp";
+    probe_options["offload_graph_io_quantization"] = "0";
+    TestQDQModelAccuracy<uint8_t>(
+        GetResizeModelBuilder(TestInputDef<float>(input_shape, false, input_data),
+                              output_shape, "linear", transformation_mode, ""),
+        GetQDQResizeModelBuilder<uint8_t>(TestInputDef<float>(input_shape, false, input_data),
+                                          output_shape, "linear", transformation_mode, ""),
+        probe_options, /*opset_version=*/19, ExpectedEPNodeAssignment::All);
+    if (::testing::Test::IsSkipped()) return;
+  }
+
+  // Device supports this test: now re-run with graph dump enabled to inspect the QNN graph.
+  fs::remove_all(graph_dir);
+  fs::create_directories(graph_dir);
+  auto cleanup = gsl::finally([&graph_dir]() { fs::remove_all(graph_dir); });
+
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+  provider_options["dump_json_qnn_graph"] = "1";
+  provider_options["json_qnn_graph_dir"] = graph_dir.string();
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+  provider_options["num_graph_prepare_threads"] = "1";
+#endif
+  TestQDQModelAccuracy<uint8_t>(
+      GetResizeModelBuilder(TestInputDef<float>(input_shape, false, input_data),
+                            output_shape, "linear", transformation_mode, ""),
+      GetQDQResizeModelBuilder<uint8_t>(TestInputDef<float>(input_shape, false, input_data),
+                                        output_shape, "linear", transformation_mode, ""),
+      provider_options, /*opset_version=*/19, ExpectedEPNodeAssignment::All);
+  AssertOpInQnnGraph(graph_dir, expected_qnn_op, 1);
+  AssertOpInQnnGraph(graph_dir, forbidden_qnn_op, 0);
+}
+
+// Asserts rank-4 linear + pytorch_half_pixel Resize lowers to QNN's ResizeBilinear
+// when both output spatial dims > 1. The other path tripped HTP op validation
+// with "Wrong number of Parameters 6 / 0xc26 / failure code 3110".
+TEST_F(QnnHTPBackendTests, ResizeU8_2xLinearPytorchHalfPixel_EmitsResizeBilinear) {
+  RunQDQResizeAndAssertQnnOp(/*input_shape=*/{1, 3, 4, 4}, /*output_shape=*/{1, 3, 8, 8},
+                             "pytorch_half_pixel", /*expected=*/"ResizeBilinear",
+                             /*forbidden=*/"Resize", "resize_phpx_multi_pixel_qnn_graph");
+}
+
+// Locks formula equivalence between ONNX pytorch_half_pixel and QNN
+// ResizeBilinear half_pixel_centers=true at non-integer scale (input 5x5 ->
+// output 7x7, scale = 1.4). Integer scales (e.g. 2x) coincidentally mask
+// half-pixel formula divergence; non-integer scales surface them.
+TEST_F(QnnHTPBackendTests, ResizeU8_NonIntScaleLinearPytorchHalfPixel_EmitsResizeBilinear) {
+  RunQDQResizeAndAssertQnnOp(/*input_shape=*/{1, 3, 5, 5}, /*output_shape=*/{1, 3, 7, 7},
+                             "pytorch_half_pixel", /*expected=*/"ResizeBilinear",
+                             /*forbidden=*/"Resize", "resize_phpx_non_int_scale_qnn_graph");
+}
+
+// Guards the else-branch of IsPyTorchHalfPixelEquivalentToHalfPixel: when an
+// output spatial dim == 1, pytorch_half_pixel pins the source coord to 0 and is
+// no longer equivalent to half_pixel, so rank-4 linear Resize must fall back to
+// QNN's generic Resize op (which natively supports pytorch_half_pixel).
+TEST_F(QnnHTPBackendTests, ResizeU8_DownsampleToHeight1_LinearPytorchHalfPixel) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 24);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 2}, false, input_data),
+                              {1, 3, 1, 2}, "linear", "pytorch_half_pixel", "",
+                              ExpectedEPNodeAssignment::All, 19);
+}
+
+// Pairs with ResizeU8_2xLinearPytorchHalfPixel_EmitsResizeBilinear to lock both
+// exits of IsPyTorchHalfPixelEquivalentToHalfPixel: H==1 must use generic Resize.
+TEST_F(QnnHTPBackendTests, ResizeU8_DownsampleToHeight1_LinearPytorchHalfPixel_EmitsResize) {
+  RunQDQResizeAndAssertQnnOp(/*input_shape=*/{1, 3, 4, 2}, /*output_shape=*/{1, 3, 1, 2},
+                             "pytorch_half_pixel", /*expected=*/"Resize",
+                             /*forbidden=*/"ResizeBilinear", "resize_phpx_h1_qnn_graph");
+}
+
+// Symmetric W==1 fallback: catches future bugs where someone swaps h_axis/w_axis
+// or accidentally checks only one spatial dim in the predicate.
+TEST_F(QnnHTPBackendTests, ResizeU8_DownsampleToWidth1_LinearPytorchHalfPixel_EmitsResize) {
+  RunQDQResizeAndAssertQnnOp(/*input_shape=*/{1, 3, 2, 4}, /*output_shape=*/{1, 3, 2, 1},
+                             "pytorch_half_pixel", /*expected=*/"Resize",
+                             /*forbidden=*/"ResizeBilinear", "resize_phpx_w1_qnn_graph");
+}
+
+// Test 2x QDQ Resize mode: "linear", coordinate_transformation_mode: "half_pixel"
+// Maps to QNN's ResizeBilinear operator.
+TEST_F(QnnHTPBackendTests, ResizeU8_2xLinearHalfPixel) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                              {1, 3, 8, 8}, "linear", "half_pixel", "",
+                              ExpectedEPNodeAssignment::All,
+                              19);
+}
+
+// Test 2x QDQ Resize mode: "linear", coordinate_transformation_mode: "align_corners"
+// Maps to QNN's ResizeBilinear operator.
+TEST_F(QnnHTPBackendTests, ResizeU8_2xLinearAlignCorners) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                              {1, 3, 8, 8}, "linear", "align_corners", "",
+                              ExpectedEPNodeAssignment::All,
+                              19);
+}
+
+// Test 2x QDQ Resize mode: "linear", coordinate_transformation_mode: "asymmetric"
+// Maps to QNN's ResizeBilinear operator.
+TEST_F(QnnHTPBackendTests, ResizeU8_2xLinearAsymmetric) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                              {1, 3, 8, 8}, "linear", "asymmetric", "",
+                              ExpectedEPNodeAssignment::All,
+                              19);
+}
+
+// Test 2x QDQ Resize mode: "nearest", coordinate_transformation_mode: "half_pixel", nearest_mode: "round_prefer_floor"
+// Maps to QNN's ResizeNearestNeighbor operator.
+TEST_F(QnnHTPBackendTests, ResizeU8_2xNearestHalfPixelRoundPreferFloor) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                              {1, 3, 8, 8}, "nearest", "half_pixel", "round_prefer_floor",
+                              ExpectedEPNodeAssignment::All);
+}
+
+// Test 2x QDQ Resize mode: "nearest", coordinate_transformation_mode: "half_pixel", nearest_mode: "round_prefer_Ceil"
+// Maps to QNN's ResizeNearestNeighbor operator.
+TEST_F(QnnHTPBackendTests, ResizeU8_2xNearestHalfPixelRoundPreferCeil) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                              {1, 3, 8, 8}, "nearest", "half_pixel", "round_prefer_ceil",
+                              ExpectedEPNodeAssignment::All);
+}
+
+// Test 2x QDQ Resize mode: "nearest", coordinate_transformation_mode: "align_corners", nearest_mode: "round_prefer_ceil"
+// Maps to QNN's ResizeNearestNeighbor operator.
+// UPDATE: "round_prefer_ceil" is supported as of QNN SDK 2.21 if using "align_corners". (Unsupported in QNN SDK 2.19).
+TEST_F(QnnHTPBackendTests, ResizeU8_2xNearestAlignCornersRoundPreferCeil) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                              {1, 3, 8, 8}, "nearest", "align_corners", "round_prefer_ceil",
+                              ExpectedEPNodeAssignment::All);
+}
+
+// Test 2x QDQ Resize mode: "nearest", coordinate_transformation_mode: "asymmetric", nearest_mode: "ceil"
+// Maps to QNN's ResizeNearestNeighbor operator.
+TEST_F(QnnHTPBackendTests, ResizeU8_2xNearestAsymmetricCeil_Unsupported) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                              {1, 3, 8, 8}, "nearest", "asymmetric", "ceil",
+                              ExpectedEPNodeAssignment::None);
+}
+
+// Test 3x QDQ Resize mode: "nearest", coordinate_transformation_mode: "asymmetric", nearest_mode: "floor".
+// Maps to QNN's ResizeNearestNeighbor operator.
+TEST_F(QnnHTPBackendTests, ResizeU8_3xNearestAsymmetricFloor) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                              {1, 3, 12, 12}, "nearest", "asymmetric", "floor",
+                              ExpectedEPNodeAssignment::All);
+}
+
+// Test 2x QDQ Resize mode: "nearest", coordinate_transformation_mode: "asymmetric", nearest_mode: "round_prefer_floor"
+// Maps to QNN's ResizeNearestNeighbor operator.
+// UPDATE: "round_prefer_floor" no longer supported in QNN SDK 2.21 (supported in QNN SDK 2.19)
+TEST_F(QnnHTPBackendTests, ResizeU8_2xNearestAsymmetricRoundPreferFloor_Unsupported) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 8);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 2, 2, 2}, false, input_data),
+                              {1, 2, 4, 4}, "nearest", "asymmetric", "round_prefer_floor",
+                              ExpectedEPNodeAssignment::None);  // No longer supported as of QNN SDK 2.21
+}
+
+// Test 3x QDQ Resize mode: "nearest", coordinate_transformation_mode: "asymmetric", nearest_mode: "round_prefer_floor"
+// QNN EP uses QNN's Resize op.
+//
+// TODO: Inaccuracy detected for output 'output_0', element 2.
+// Output quant params: scale=0.078431375324726105, zero_point=127.
+// Expected val: -3.3333334922790527
+// QNN QDQ val: -9.960784912109375 (err 6.6274514198303223)
+// CPU QDQ val: -3.2941176891326904 (err 0.039215803146362305)
+//
+// More debugging info:
+// Input elements f32[1,1,2,2] = -10.0000000 -3.33333349 3.33333302 10.0000000
+// ORT CPU EP (f32 model) outputs: -10.0000000 -10.0000000 -3.33333349 -3.33333349 -3.33333349 -3.33333349 -10.00 ...
+// ORT CPU EP (qdq model) outputs: -9.96078491 -9.96078491 -3.29411769 -3.29411769 -3.29411769 -3.29411769 -9.961 ...
+// ORT QNN EP (qdq model) outputs: -9.96078491 -9.96078491 -9.96078491 -3.37254906 -3.37254906 -3.37254906 -9.961 ...
+// UPDATE: "round_prefer_floor" no longer supported in QNN SDK 2.21 (supported in QNN SDK 2.19)
+TEST_F(QnnHTPBackendTests, ResizeU8_3xNearestAsymmetricRoundPreferFloor_Unsupported) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 4);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 1, 2, 2}, false, input_data),
+                              {1, 1, 6, 6}, "nearest", "asymmetric", "round_prefer_floor",
+                              ExpectedEPNodeAssignment::None);  // No longer supported as of QNN SDK 2.21
+}
+
+// Test 0.5x QDQ Resize mode: "nearest", coordinate_transformation_mode: "asymmetric", nearest_mode: "floor"
+// Maps to QNN's ResizeNearestNeighbor operator.
+TEST_F(QnnHTPBackendTests, ResizeU8_HalfNearestAsymmetricFloor) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                              {1, 3, 2, 2}, "nearest", "asymmetric", "floor",
+                              ExpectedEPNodeAssignment::All);
+}
+
+// Test 2x QDQ Resize mode: "nearest", coordinate_transformation_mode: "tf_half_pixel_for_nn",
+// nearest_mode: "round_prefer_floor". Not supported on QNN HTP; falls back to CPU EP.
+TEST_F(QnnHTPBackendTests, ResizeU8_2xNearestTfHalfPixelForNNRoundPreferFloor_Unsupported) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                              {1, 3, 8, 8}, "nearest", "tf_half_pixel_for_nn", "round_prefer_floor",
+                              ExpectedEPNodeAssignment::None);
+}
+
+// Test 2x QDQ Resize mode: "nearest", coordinate_transformation_mode: "tf_half_pixel_for_nn",
+// nearest_mode: "round_prefer_ceil". Not supported on QNN HTP; falls back to CPU EP.
+TEST_F(QnnHTPBackendTests, ResizeU8_2xNearestTfHalfPixelForNNRoundPreferCeil_Unsupported) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                              {1, 3, 8, 8}, "nearest", "tf_half_pixel_for_nn", "round_prefer_ceil",
+                              ExpectedEPNodeAssignment::None);
+}
+
+// Test 2x QDQ Resize mode: "nearest", coordinate_transformation_mode: "tf_half_pixel_for_nn",
+// nearest_mode: "floor". Maps to QNN Resize(2x, ASYMMETRIC) + StridedSlice.
+TEST_F(QnnHTPBackendTests, ResizeU8_2xNearestTfHalfPixelForNNFloor) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                              {1, 3, 8, 8}, "nearest", "tf_half_pixel_for_nn", "floor",
+                              ExpectedEPNodeAssignment::All);
+}
+
+// Test 0.5x QDQ Resize mode: "nearest", coordinate_transformation_mode: "tf_half_pixel_for_nn",
+// nearest_mode: "floor". Maps to QNN Resize(2x, ASYMMETRIC) + StridedSlice.
+TEST_F(QnnHTPBackendTests, ResizeU8_HalfNearestTfHalfPixelForNNFloor) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                              {1, 3, 2, 2}, "nearest", "tf_half_pixel_for_nn", "floor",
+                              ExpectedEPNodeAssignment::All);
+}
+
+// Test QDQ Resize downsample with mode: "nearest", coordinate_transformation_mode: "tf_half_pixel_for_nn",
+// nearest_mode: "floor". Maps to QNN Resize(2x, ASYMMETRIC) + StridedSlice.
+TEST_F(QnnHTPBackendTests, Resize_DownSample_Nearest_TfHalfPixelForNN) {
+  std::vector<float> input_data = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 1, 2, 4}, false, input_data),
+                              {1, 1, 1, 2}, "nearest", "tf_half_pixel_for_nn", "floor",
+                              ExpectedEPNodeAssignment::All);
+}
+
+// Tripwire: linear + tf_half_pixel_for_nn is not supported on QNN HTP.
+// IsOpSupported rejects it (only nearest+floor is admitted); the node falls back to CPU EP.
+TEST_F(QnnHTPBackendTests, ResizeU8_2xLinearTfHalfPixelForNN_Unsupported) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                              {1, 3, 8, 8}, "linear", "tf_half_pixel_for_nn", "",
+                              ExpectedEPNodeAssignment::None);
+}
+
+// Tripwire: cubic + tf_half_pixel_for_nn is not supported on QNN HTP.
+// IsOpSupported rejects it (only nearest+floor is admitted); the node falls back to CPU EP.
+TEST_F(QnnHTPBackendTests, ResizeU8_2xCubicTfHalfPixelForNN_Unsupported) {
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 48);
+  RunQDQResizeOpTest<uint8_t>(TestInputDef<float>({1, 3, 4, 4}, false, input_data),
+                              {1, 3, 8, 8}, "cubic", "tf_half_pixel_for_nn", "",
+                              ExpectedEPNodeAssignment::None,
+                              19,
+                              QDQTolerance(),
+                              {},
+                              GraphOptimizationLevel::ORT_DISABLE_ALL);
+}
+
+#endif  // defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
+
+}  // namespace test
+}  // namespace onnxruntime
+
+#endif  // !defined(ORT_MINIMAL_BUILD)

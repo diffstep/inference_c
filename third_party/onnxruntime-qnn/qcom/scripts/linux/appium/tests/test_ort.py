@@ -1,0 +1,128 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: MIT
+
+import tempfile
+from collections.abc import Iterable
+from pathlib import Path, PurePosixPath
+from typing import NamedTuple
+
+import pytest
+from ctest_plan import CTestPlan
+from qdc_helpers import TestBase
+
+
+class ModelTestDef(NamedTuple):
+    name: str
+    backend: str
+    model_root: Path
+    working_dir: Path | None = None
+    extra_args: Iterable[str] = []
+
+
+CONFIG = TestBase.config()
+
+CTEST_PLAN = CTestPlan(
+    Path(CONFIG.host_build_root) / "CTestTestfile.cmake",
+    str(PurePosixPath(CONFIG.device_build_root)),
+)
+
+MODEL_TEST_DEFINITIONS = [
+    ModelTestDef(
+        "node",
+        "cpu",
+        Path(CONFIG.device_runtime_path)
+        / "cmake"
+        / "external"
+        / "onnx"
+        / "onnx"
+        / "backend"
+        / "test"
+        / "data"
+        / "node",
+    ),
+    ModelTestDef(
+        "float32",
+        "cpu",
+        Path(CONFIG.device_onnx_model_test_path) / "testdata" / "float32",
+        Path(CONFIG.device_onnx_model_test_path),
+    ),
+    ModelTestDef(
+        "qdq",
+        "htp",
+        Path(CONFIG.device_onnx_model_test_path) / "testdata" / "qdq",
+        Path(CONFIG.device_onnx_model_test_path),
+    ),
+    ModelTestDef(
+        "qdq-with-context-cache",
+        "htp",
+        Path(CONFIG.device_onnx_model_test_path) / "testdata" / "qdq-with-context-cache",
+        Path(CONFIG.device_onnx_model_test_path),
+        ["-f"],
+    ),
+]
+
+MODEL_TEST_IDS = [m.name for m in MODEL_TEST_DEFINITIONS]
+
+
+class TestOrt(TestBase):
+    @pytest.mark.parametrize(["test_name", "test_cmd"], CTEST_PLAN.tests.items(), ids=CTEST_PLAN.names)
+    def test_onnxruntime_test_suite(self, test_name: str, test_cmd: list[str]) -> None:
+        if test_name in CONFIG.skip_ctests:
+            pytest.skip()
+        self.__assert_passes(self.__get_test_cmd(test_cmd))
+
+    @pytest.mark.parametrize("test_def", MODEL_TEST_DEFINITIONS, ids=MODEL_TEST_IDS)
+    def test_onnx_models(self, test_def: ModelTestDef) -> None:
+        if f"{test_def.name}" in CONFIG.skip_model_tests:
+            pytest.skip()
+        runner_exe = Path(CONFIG.device_build_root) / "onnxruntime_plugin_ep_onnx_test"
+
+        # fmt: off
+        test_cmd = [
+            str(runner_exe),
+            "-j", "1",
+            "-e", "qnn",
+            "--plugin_ep_libs", "'qnn|libonnxruntime_providers_qnn.so'",
+            "--plugin_eps", "qnn",
+            "-i", f"'backend_type|{test_def.backend}'",
+            *test_def.extra_args,
+            str(test_def.model_root),
+        ]
+        # fmt: on
+
+        model_test_log = Path(CONFIG.model_test_device_log(test_def.name))
+        self.__assert_passes(self.__get_test_cmd(test_cmd, test_def.working_dir, extra_log=model_test_log))
+
+    def __assert_passes(self, test_cmd: str) -> None:
+        self.device.shell([test_cmd])
+        with tempfile.TemporaryDirectory(prefix="TestRc-") as tmpdir:
+            rc_path = Path(tmpdir) / "rc.txt"
+            self.device.pull(self.__rc_device_path, rc_path)
+            rc = rc_path.read_text().splitlines()
+            assert len(rc) == 1
+            assert rc[0] == "0", f"Test command returned non-zero value {rc}."
+
+    def __get_test_cmd(
+        self,
+        test_cmd: list[str],
+        working_dir: Path | None = None,
+        extra_log: Path | None = None,
+    ) -> str:
+        if working_dir is None:
+            working_dir = Path(CONFIG.device_build_root)
+        test_str = " ".join(test_cmd)
+        # QNN CPU is not advertised by default; tests use it as the attach point, so opt in on-device.
+        cmd = (
+            f"cd {working_dir} && "
+            f"echo -=-=-=-=-=-=-=-=-=-=- >> {CONFIG.test_results_device_log} && "
+            f"echo Running test: {test_str} >> {CONFIG.test_results_device_log} && "
+            f"(env ORT_QNN_ENABLE_CPU_BACKEND=1 ADSP_LIBRARY_PATH={CONFIG.device_adsp_library_path} LD_LIBRARY_PATH={CONFIG.device_ld_library_path} "
+            f"{test_str}; echo $? > {self.__rc_device_path}) 2>&1 | tee -a {CONFIG.test_results_device_log}"
+        )
+        if extra_log is not None:
+            cmd += f" | tee {extra_log}"
+        return cmd
+
+    @property
+    def __rc_device_path(self) -> Path:
+        return Path(CONFIG.device_results_root) / "rc.txt"

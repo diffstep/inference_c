@@ -1,0 +1,3804 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#include <filesystem>
+#include <fstream>
+#include <unordered_set>
+#include <string>
+#include <thread>
+#include <memory>
+
+#include "nlohmann/json.hpp"
+
+#include "cpu_provider_factory.h"  // For OrtSessionOptionsAppendExecutionProvider_CPU
+#include "onnxruntime_cxx_api.h"
+#include "onnxruntime_session_options_config_keys.h"
+
+#include "core/providers/qnn/builder/qnn_ep_sanitize_utils.h"
+
+#include "test/providers/qnn/qnn_test_utils.h"
+#include "test/util/include/api_asserts.h"
+
+#include "gtest/gtest.h"
+#include "gmock/gmock.h"
+
+using namespace ONNX_NAMESPACE;
+
+#define ORT_MODEL_FOLDER ORT_TSTR("testdata/")
+// interface macro defined in combaseapi.h conflicts with its use in this file.
+#undef interface
+
+constexpr std::string_view kDlcOutputDir("dlc_output");
+
+// in test_main.cc
+extern std::unique_ptr<Ort::Env> ort_env;
+extern "C" void ortenv_setup();
+extern "C" void ortenv_teardown();
+
+namespace onnxruntime {
+namespace test {
+
+// test uses ONNX model so can't be run in a minimal build.
+// TODO: When we need QNN in a minimal build we should add an ORT format version of the model
+#if !defined(ORT_MINIMAL_BUILD)
+
+static bool SessionHasEp(Ort::Session& session, const char* ep_name) {
+  std::vector<Ort::ConstEpAssignedSubgraph> ep_subgraphs = session.GetEpGraphAssignmentInfo();
+  for (const auto& ep_subgraph : ep_subgraphs) {
+    if (std::strcmp(ep_subgraph.GetEpName().c_str(), ep_name) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Tests the `session.disable_cpu_ep_fallback` configuration option when the backend cannot be loaded.
+// When the option is enabled, session creation throws an exception because the backend cannot be found.
+TEST(QnnEP, TestDisableCPUFallback_BackendNotFound) {
+  Ort::SessionOptions so;
+  so.AddConfigEntry(kOrtSessionOptionsDisableCPUEPFallback, "1");  // Disable fallback to the CPU EP.
+
+  ProviderOptions options;
+#if defined(_WIN32)
+  options["backend_path"] = "DoesNotExist.dll";  // Invalid backend path!
+#else
+  options["backend_path"] = "libDoesNotExist.so";  // Invalid backend path!
+#endif
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, options);
+
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "constant_floats.onnx";
+
+  try {
+    Ort::Session session(*ort_env, ort_model_path, so);
+    FAIL();  // Should not get here!
+  } catch (const Ort::Exception& excpt) {
+    ASSERT_EQ(excpt.GetOrtErrorCode(), ORT_FAIL);
+    ASSERT_THAT(excpt.what(), testing::HasSubstr("This session contains graph nodes that are assigned to the default "
+                                                 "CPU EP, but fallback to CPU EP has been explicitly disabled by "
+                                                 "the user."));
+  }
+}
+
+// Tests the `session.disable_cpu_ep_fallback` configuration option when the entire model cannot be assigned to QNN EP.
+// When the option is enabled, Session creation should throw an exception.
+TEST(QnnEP, TestDisableCPUFallback_ModelNotFullySupported) {
+  Ort::SessionOptions so;
+  so.AddConfigEntry(kOrtSessionOptionsDisableCPUEPFallback, "1");  // Disable fallback to the CPU EP.
+
+  ProviderOptions options;
+#if defined(_WIN32)
+  options["backend_path"] = "QnnCpu.dll";
+#else
+  options["backend_path"] = "libQnnCpu.so";
+#endif
+  options["offload_graph_io_quantization"] = "0";
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, options);
+
+  // QNN EP doesn't support MatMulInteger.
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "qnn_ep_partial_support.onnx";
+
+  try {
+    Ort::Session session(*ort_env, ort_model_path, so);
+    FAIL();  // Should not get here!
+  } catch (const Ort::Exception& excpt) {
+    ASSERT_EQ(excpt.GetOrtErrorCode(), ORT_FAIL);
+    ASSERT_THAT(excpt.what(), testing::HasSubstr("This session contains graph nodes that are assigned to the default "
+                                                 "CPU EP, but fallback to CPU EP has been explicitly disabled by "
+                                                 "the user."));
+  }
+}
+
+// The model is supported on QNN CPU backend, but CPU fallback is disabled
+// QNN EP report error for this scenario also
+TEST(QnnEP, TestDisableCPUFallback_TryingToRunOnQnnCPU) {
+  auto input_defs = {TestInputDef<float>({1, 2, 2, 2}, false, -10.0f, 10.0f),
+                     TestInputDef<float>({1, 2, 2, 2}, false, -10.0f, 10.0f)};
+  auto model_func = BuildOpTestCase<float>("Add_node", "Add", input_defs, {}, {}, kOnnxDomain);
+
+  const std::unordered_map<std::string, int> domain_to_version = {{"", 13}, {kMSDomain, 1}};
+
+  ModelTestBuilder helper;
+  model_func(helper);
+  for (const auto& [domain, version] : domain_to_version) {
+    const gsl::not_null<ONNX_NAMESPACE::OperatorSetIdProto*> opset_id_proto{helper.model_.add_opset_import()};
+    opset_id_proto->set_domain(domain);
+    opset_id_proto->set_version(version);
+  }
+  helper.model_.set_ir_version(ONNX_NAMESPACE::Version::IR_VERSION);
+
+  // Serialize the model to a string.
+  std::string model_data;
+  helper.model_.SerializeToString(&model_data);
+
+  Ort::SessionOptions so;
+  so.AddConfigEntry(kOrtSessionOptionsDisableCPUEPFallback, "1");  // Disable fallback to the CPU EP.
+
+  ProviderOptions options;
+#if defined(_WIN32)
+  options["backend_path"] = "QnnCpu.dll";
+#else
+  options["backend_path"] = "libQnnCpu.so";
+#endif
+  options["offload_graph_io_quantization"] = "0";
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, options);
+
+  try {
+    Ort::Session session(*ort_env, model_data.data(), model_data.size(), so);
+    FAIL();  // Should not get here!
+  } catch (const Ort::Exception& excpt) {
+    ASSERT_EQ(excpt.GetOrtErrorCode(), ORT_FAIL);
+    ASSERT_THAT(excpt.what(), testing::HasSubstr("This session contains graph nodes that are assigned to the default "
+                                                 "CPU EP, but fallback to CPU EP has been explicitly disabled by "
+                                                 "the user."));
+  }
+}
+
+// Tests invalid use of the `session.disable_cpu_ep_fallback` configuration option.
+// It is invalid to set the option and explicitly add the CPU EP to the session.
+TEST(QnnEP, TestDisableCPUFallback_ConflictingConfig) {
+  Ort::SessionOptions so;
+  so.AddConfigEntry(kOrtSessionOptionsDisableCPUEPFallback, "1");  // Disable fallback to the CPU EP.
+
+  ProviderOptions options;
+#if defined(_WIN32)
+  options["backend_path"] = "QnnCpu.dll";
+#else
+  options["backend_path"] = "libQnnCpu.so";
+#endif
+  options["offload_graph_io_quantization"] = "0";
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, options);
+
+  // Invalid! Adds CPU EP to session, but also disables CPU fallback.
+  so.AppendExecutionProvider_CPU(1);
+
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "constant_floats.onnx";
+
+  try {
+    Ort::Session session(*ort_env, ort_model_path, so);
+    FAIL();  // Should not get here!
+  } catch (const Ort::Exception& excpt) {
+    ASSERT_EQ(excpt.GetOrtErrorCode(), ORT_INVALID_ARGUMENT);
+    ASSERT_THAT(excpt.what(), testing::HasSubstr("Conflicting session configuration: explicitly added the CPU EP to the "
+                                                 "session, but also disabled fallback to the CPU EP via session "
+                                                 "configuration options."));
+  }
+}
+
+TEST(QnnEP, TestInvalidSpecificationOfBothBackendTypeAndBackendPath) {
+  Ort::SessionOptions so{};
+  // Add this session option for GetEpGraphAssignmentInfo in SessionHasEp
+  so.AddConfigEntry(kOrtSessionOptionsRecordEpGraphAssignmentInfo, "1");
+
+  ProviderOptions options;
+  options["backend_type"] = "cpu";
+#if defined(_WIN32)
+  options["backend_path"] = "QnnCpu.dll";
+#else
+  options["backend_path"] = "libQnnCpu.so";
+#endif
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, options);
+
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "constant_floats.onnx";
+
+  try {
+    Ort::Session session(*ort_env, ort_model_path, so);
+    // FAIL();
+    // TODO: Replace the following assertion with FAIL() once upstream completed.
+    ASSERT_FALSE(SessionHasEp(session, kQnnExecutionProvider))
+        << "QNN EP was found in registered providers for session "
+        << "when both backend_type and backend_path were specified, which should not happen.";
+  } catch (const Ort::Exception& e) {
+    ASSERT_EQ(e.GetOrtErrorCode(), ORT_FAIL);
+    ASSERT_THAT(e.what(), testing::HasSubstr("Only one of 'backend_type' and 'backend_path' should be set."));
+  }
+}
+
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
+// Tests that the QNN EP is registered when added via the public C++ API.
+// Loads a simple ONNX model that adds floats.
+TEST_F(QnnHTPBackendTests, TestAddEpUsingPublicApi) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  ProviderOptions options;
+#if defined(_WIN32)
+  options["backend_path"] = "QnnHtp.dll";
+#else
+  options["backend_path"] = "libQnnHtp.so";
+#endif
+
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+  // By default, 8 is used, which will impact time to run all
+  // unit tests due to overhead of thread creation/destruction
+  options["num_graph_prepare_threads"] = "1";
+#endif
+
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "constant_floats.onnx";
+
+  Ort::SessionOptions so;
+  // Add this session option for GetEpGraphAssignmentInfo in SessionHasEp
+  so.AddConfigEntry(kOrtSessionOptionsRecordEpGraphAssignmentInfo, "1");
+
+  // TODO: Remove #ifdef when Windows Arm64 machines support the CPU backend.
+#if defined(__linux__)
+  so.AddConfigEntry(kOrtSessionOptionsDisableCPUEPFallback, "1");  // Disable fallback to the CPU EP.
+#endif
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, options);
+
+  ScopedOrtSession scoped(std::move(registered_ep_device), Ort::Session(*ort_env, ort_model_path, so));
+  ASSERT_TRUE(SessionHasEp(scoped.session(), kQnnExecutionProvider))
+      << "QNN EP was not found in registered providers for session "
+      << "when added to session with name '" << kQnnExecutionProvider << "'";
+}
+
+// Conv node `Conv` is not supported: GetFileLength for conv_qdq_external_ini.bin failed:open file conv_qdq_external_ini.bin fail,
+// errcode = 2 - The system cannot find the file specified.
+TEST_F(QnnHTPBackendTests, TestConvWithExternalData) {
+  Ort::SessionOptions so;
+  ProviderOptions options;
+#if defined(_WIN32)
+  options["backend_path"] = "QnnHtp.dll";
+#else
+  options["backend_path"] = "libQnnHtp.so";
+#endif
+  options["offload_graph_io_quantization"] = "0";
+
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+  // By default, 8 is used, which will impact time to run all
+  // unit tests due to overhead of thread creation/destruction
+  options["num_graph_prepare_threads"] = "1";
+#endif
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, options);
+
+  so.AppendExecutionProvider_CPU(1);
+
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "conv_qdq_external_ini.onnx";
+
+  ScopedOrtSession scoped(std::move(registered_ep_device), Ort::Session(*ort_env, ort_model_path, so));
+}
+
+TEST_F(QnnHTPBackendTests, RunConvInt4Model) {
+  Ort::SessionOptions so;
+
+  so.AddConfigEntry(kOrtSessionOptionsDisableCPUEPFallback, "1");  // Disable fallback to the CPU EP.
+  so.SetGraphOptimizationLevel(ORT_ENABLE_ALL);
+  ProviderOptions options;
+
+#if defined(_WIN32)
+  options["backend_path"] = "QnnHtp.dll";
+#else
+  options["backend_path"] = "libQnnHtp.so";
+#endif
+
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+  // By default, 8 is used, which will impact time to run all
+  // unit tests due to overhead of thread creation/destruction
+  options["num_graph_prepare_threads"] = "1";
+#endif
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, options);
+
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "conv.int4_weights.qdq.onnx";
+  ScopedOrtSession scoped(std::move(registered_ep_device), Ort::Session(*ort_env, ort_model_path, so));
+
+  std::array<int64_t, 4> inputs_shape{1, 3, 8, 8};
+  std::vector<float> input0_data(1 * 3 * 8 * 8, 0.2f);
+
+  auto memory_info = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);
+  std::vector<Ort::Value> ort_inputs;
+  std::vector<const char*> ort_input_names;
+
+  // Add input0
+  ort_inputs.emplace_back(Ort::Value::CreateTensor<float>(
+      memory_info, input0_data.data(), input0_data.size(), inputs_shape.data(), inputs_shape.size()));
+  ort_input_names.push_back("input_0");
+
+  // Run session and get outputs
+  std::array<const char*, 1> output_names{"output_0"};
+  std::vector<Ort::Value> ort_outputs = scoped.session().Run(Ort::RunOptions{nullptr}, ort_input_names.data(), ort_inputs.data(),
+                                                             ort_inputs.size(), output_names.data(), output_names.size());
+
+  // Check output shape.
+  Ort::Value& ort_output = ort_outputs[0];
+  auto typeshape = ort_output.GetTensorTypeAndShapeInfo();
+  std::vector<int64_t> output_shape = typeshape.GetShape();
+
+  EXPECT_THAT(output_shape, ::testing::ElementsAre(1, 5, 6, 6));
+}
+#endif  // #if defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
+
+enum class TestBackend {
+  Cpu,
+  Htp,
+  Saver,
+  Ir,
+};
+
+static std::string ToBackendLibName(TestBackend backend) {
+  switch (backend) {
+    case TestBackend::Cpu:
+      return "Cpu";
+    case TestBackend::Htp:
+      return "Htp";
+    case TestBackend::Saver:
+      return "Saver";
+    case TestBackend::Ir:
+      return "Ir";
+    default:
+      assert(false && "Invalid TestBackend value.");
+      return "";
+  }
+}
+
+static void AddSerializerConfigs(TestBackend serializer_backend, ProviderOptions& options) {
+  std::string serializer_lib = ToBackendLibName(serializer_backend);
+  std::string serializer_path_key;
+
+  switch (serializer_backend) {
+    case TestBackend::Ir:
+      serializer_path_key = "qnn_ir_backend_path";
+      options["dump_qnn_ir_dlc"] = "1";
+      options["dump_qnn_ir_dlc_dir"] = kDlcOutputDir;
+      break;
+    case TestBackend::Saver:
+      serializer_path_key = "qnn_saver_path";
+      break;
+    default:
+      assert(false && "AddSerializerConfigs: only Ir and Saver are valid serializer backends.");
+      return;
+  }
+
+#if defined(_WIN32)
+  options[serializer_path_key] = "Qnn" + serializer_lib + ".dll";
+#else
+  options[serializer_path_key] = "libQnn" + serializer_lib + ".so";
+#endif
+}
+
+static std::unique_ptr<ScopedOrtSession> InitNHWCResizeModel(const ORTCHAR_T* ort_model_path,
+                                                             TestBackend backend,
+                                                             std::optional<TestBackend> serializer_backend = std::nullopt,
+                                                             std::string htp_graph_finalization_opt_mode = "",
+                                                             std::string qnn_context_priority = "",
+                                                             std::string soc_model = "",
+                                                             std::string htp_arch = "",
+                                                             std::string device_id = "") {
+  Ort::SessionOptions so;
+
+  // Ensure all type/shape inference warnings result in errors!
+  so.AddConfigEntry(kOrtSessionOptionsConfigStrictShapeTypeInference, "1");
+  so.SetGraphOptimizationLevel(ORT_ENABLE_ALL);
+
+  ProviderOptions options;
+  options["offload_graph_io_quantization"] = "0";
+
+  std::string backend_lib = ToBackendLibName(backend);
+
+#if defined(_WIN32)
+  options["backend_path"] = "Qnn" + backend_lib + ".dll";
+
+#if (defined(__aarch64__) || defined(_M_ARM64))
+  // By default, 8 is used, which will impact time to run all
+  // unit tests due to overhead of thread creation/destruction
+  options["num_graph_prepare_threads"] = "1";
+#endif
+
+#else
+  options["backend_path"] = "libQnn" + backend_lib + ".so";
+#endif
+
+  if (serializer_backend) {
+    AddSerializerConfigs(*serializer_backend, options);
+  }
+
+  if (!htp_graph_finalization_opt_mode.empty()) {
+    options["htp_graph_finalization_optimization_mode"] = std::move(htp_graph_finalization_opt_mode);
+  }
+
+  if (!qnn_context_priority.empty()) {
+    options["qnn_context_priority"] = std::move(qnn_context_priority);
+  }
+
+  if (!soc_model.empty()) {
+    options["soc_model"] = std::move(soc_model);
+  }
+
+  if (!htp_arch.empty()) {
+    options["htp_arch"] = std::move(htp_arch);
+  }
+
+  if (!device_id.empty()) {
+    options["device_id"] = std::move(device_id);
+  }
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, options);
+  return std::make_unique<ScopedOrtSession>(std::move(registered_ep_device),
+                                            Ort::Session(*ort_env, ort_model_path, so));
+}
+
+// Helper function that runs an ONNX model with a NHWC Resize operator to test that
+// type/shape inference succeeds during layout transformation.
+// Refer to onnxruntime/core/graph/contrib_ops/nhwc_inference_context.h.
+//
+// The models passed to this function are subgraphs extracted from a larger model that exhibited
+// shape inferencing issues on QNN. Thus, the models are expected to have a specific input/output
+// types and shapes.
+static void RunNHWCResizeModel(const ORTCHAR_T* ort_model_path,
+                               TestBackend backend,
+                               std::optional<TestBackend> serializer_backend = std::nullopt,
+                               std::string htp_graph_finalization_opt_mode = "",
+                               std::string qnn_context_priority = "",
+                               std::string soc_model = "",
+                               std::string htp_arch = "",
+                               std::string device_id = "") {
+  auto scoped = InitNHWCResizeModel(ort_model_path,
+                                    backend,
+                                    serializer_backend,
+                                    htp_graph_finalization_opt_mode,
+                                    qnn_context_priority,
+                                    soc_model,
+                                    htp_arch,
+                                    device_id);
+
+  // Input can be all zeros since we're testing for correct shape inference.
+  std::array<float, 1 * 3 * 4 * 5> input0_data = {};
+  std::array<float, 1 * 3 * 4 * 5> input1_data = {};
+  std::array<float, 1 * 3 * 4 * 5> input2_data = {};
+
+  auto memory_info = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);
+  std::vector<Ort::Value> ort_inputs;
+  std::vector<const char*> ort_input_names;
+
+  // Add input0
+  std::array<int64_t, 4> inputs_shape{1, 3, 4, 5};
+  ort_inputs.emplace_back(Ort::Value::CreateTensor<float>(
+      memory_info, input0_data.data(), input0_data.size(), inputs_shape.data(), inputs_shape.size()));
+  ort_input_names.push_back("input0");
+
+  // Add input1
+  ort_inputs.emplace_back(Ort::Value::CreateTensor<float>(
+      memory_info, input1_data.data(), input1_data.size(), inputs_shape.data(), inputs_shape.size()));
+  ort_input_names.push_back("input1");
+
+  // Add input2
+  ort_inputs.emplace_back(Ort::Value::CreateTensor<float>(
+      memory_info, input2_data.data(), input2_data.size(), inputs_shape.data(), inputs_shape.size()));
+  ort_input_names.push_back("input2");
+
+  // Run session and get outputs
+  std::array<const char*, 2> output_names{"output0", "output1"};
+  std::vector<Ort::Value> ort_outputs = scoped->session().Run(Ort::RunOptions{nullptr}, ort_input_names.data(), ort_inputs.data(),
+                                                              ort_inputs.size(), output_names.data(), output_names.size());
+
+  // Check output shape.
+  Ort::Value& ort_output = ort_outputs[1];
+  auto typeshape = ort_output.GetTensorTypeAndShapeInfo();
+  std::vector<int64_t> output_shape = typeshape.GetShape();
+
+  EXPECT_THAT(output_shape, ::testing::ElementsAre(1, 6, 7, 10));
+}
+
+// Test shape inference of NHWC Resize operator (opset 11) that uses
+// the scales input. Use the QNN CPU backend.
+TEST_F(QnnCPUBackendTests, TestNHWCResizeShapeInference_scales_opset11) {
+  RunNHWCResizeModel(ORT_MODEL_FOLDER "nhwc_resize_scales_opset11.onnx", TestBackend::Cpu);
+}
+
+// Test shape inference of NHWC Resize operator (opset 18) that uses
+// the scales input. Use the QNN CPU backend.
+TEST_F(QnnCPUBackendTests, TestNHWCResizeShapeInference_scales_opset18) {
+  RunNHWCResizeModel(ORT_MODEL_FOLDER "nhwc_resize_scales_opset18.onnx", TestBackend::Cpu);
+}
+
+// Test shape inference of NHWC Resize operator (opset 11) that uses
+// the sizes input. Use the QNN CPU backend.
+TEST_F(QnnCPUBackendTests, TestNHWCResizeShapeInference_sizes_opset11) {
+  RunNHWCResizeModel(ORT_MODEL_FOLDER "nhwc_resize_sizes_opset11.onnx", TestBackend::Cpu);
+}
+
+// Test shape inference of NHWC Resize operator (opset 18) that uses
+// the sizes input. Use the QNN CPU backend.
+TEST_F(QnnCPUBackendTests, TestNHWCResizeShapeInference_sizes_opset18) {
+  RunNHWCResizeModel(ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.onnx", TestBackend::Cpu);
+}
+
+// Test that QNN Saver generates the expected files for a model meant to run on the QNN CPU backend.
+// QnnSaver may write flat to cwd (Linux aarch64) or to a subdirectory (Windows); the test
+// accepts either location.
+TEST_F(QnnCPUBackendTests, QnnSaver_OutputFiles) {
+  // Clean up any pre-existing Saver output from prior runs, both flat in cwd and in the default
+  // subdirectory, so stale files don't cause a false pass.
+  std::filesystem::remove("saver_output.c");
+  std::filesystem::remove("params.bin");
+  std::filesystem::remove_all("saver_output");
+
+  RunNHWCResizeModel(ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.onnx",
+                     TestBackend::Cpu,
+                     TestBackend::Saver);
+
+  // Accept saver_output.c / params.bin in flat cwd or in ./saver_output/ subdirectory.
+  // QnnSaver writes flat to cwd on Linux aarch64 and to ./saver_output/ on Windows.
+  const auto cwd = std::filesystem::current_path();
+  const auto saver_dir = cwd / "saver_output";
+  auto find_saver_file = [&cwd, &saver_dir](const std::string& filename) -> bool {
+    return std::filesystem::exists(cwd / filename) ||
+           std::filesystem::exists(saver_dir / filename);
+  };
+
+  EXPECT_TRUE(find_saver_file("saver_output.c"))
+      << "saver_output.c not found in cwd or ./saver_output/";
+  EXPECT_TRUE(find_saver_file("params.bin"))
+      << "params.bin not found in cwd or ./saver_output/";
+}
+
+// Runs a session and verifies the outputs. Can be run by individual threads.
+static void RunSessionAndVerify(Ort::Session& session, const Ort::RunOptions& run_options,
+                                const std::unordered_map<std::string, Ort::Value>& feeds,
+                                const std::vector<std::vector<int64_t>>& output_shapes,
+                                const std::vector<std::vector<float>>& output_values,
+                                int loop_count = 10) {
+  // Prepare inputs using public API
+  std::vector<std::string> ort_input_names = session.GetInputNames();
+  std::vector<std::string> ort_output_names = session.GetOutputNames();
+  size_t input_count = ort_input_names.size();
+  size_t output_count = ort_output_names.size();
+  std::vector<const char*> ort_input_names_cstr(input_count);
+  std::vector<const char*> ort_output_names_cstr(output_count);
+  std::transform(ort_input_names.begin(), ort_input_names.end(), ort_input_names_cstr.begin(),
+                 [](const std::string& s) { return s.c_str(); });
+  std::transform(ort_output_names.begin(), ort_output_names.end(), ort_output_names_cstr.begin(),
+                 [](const std::string& s) { return s.c_str(); });
+  // Let it run for a while
+  for (int it = 0; it < loop_count; ++it) {
+    std::vector<Ort::Value> ort_inputs;
+
+    // Prepare inputs using public API
+    for (size_t i = 0; i < input_count; ++i) {
+      auto memory_info = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);
+      ort_inputs.emplace_back(Ort::Value::CreateTensor(
+          memory_info,
+          (void*)feeds.at(ort_input_names[i]).GetTensorRawData(),
+          feeds.at(ort_input_names[i]).GetTensorSizeInBytes(),
+          feeds.at(ort_input_names[i]).GetTypeInfo().GetTensorTypeAndShapeInfo().GetShape().data(),
+          feeds.at(ort_input_names[i]).GetTypeInfo().GetTensorTypeAndShapeInfo().GetShape().size(),
+          feeds.at(ort_input_names[i]).GetTypeInfo().GetTensorTypeAndShapeInfo().GetElementType()));
+    }
+
+    // Run inference
+    std::vector<Ort::Value> outputs = session.Run(
+        run_options,
+        ort_input_names_cstr.data(),
+        ort_inputs.data(),
+        ort_inputs.size(),
+        ort_output_names_cstr.data(),
+        ort_output_names_cstr.size());
+
+    // Verify outputs
+    ASSERT_EQ(outputs.size(), output_shapes.size());
+    for (size_t i = 0; i < outputs.size(); i++) {
+      auto type_info = outputs[i].GetTensorTypeAndShapeInfo();
+      auto actual_shape = type_info.GetShape();
+      ASSERT_EQ(actual_shape, output_shapes[i]);
+
+      const float* output_data = outputs[i].GetTensorData<float>();
+      for (size_t j = 0; j < output_values[i].size(); j++) {
+        ASSERT_EQ(output_data[j], output_values[i][j]);
+      }
+    }
+  }
+}
+
+// Returns a function that builds a float32 model that adds 3 tensors.
+static GetTestModelFn F32BuildAdd3Tensors(const TestInputDef<float>& input0_def,
+                                          const TestInputDef<float>& input1_def,
+                                          const TestInputDef<float>& input2_def) {
+  return [input0_def, input1_def, input2_def](ModelTestBuilder& builder) {
+    builder.graph_->set_name("add3_f32_graph");
+
+    MakeTestInput<float>(builder, "input0", input0_def);
+    MakeTestInput<float>(builder, "input1", input1_def);
+    MakeTestInput<float>(builder, "input2", input2_def);
+
+    builder.AddNode("Add0", "Add", {"input0", "input1"}, {"add0_out"}, kOnnxDomain);
+    builder.AddNode("Add1", "Add", {"add0_out", "input2"}, {"output"}, kOnnxDomain);
+
+    builder.MakeOutput("output");
+  };
+}
+
+// Tests running a single session in multiple threads on the CPU backend.
+TEST_F(QnnCPUBackendTests, MultithreadSessionRun) {
+  std::unique_ptr<ModelAndBuilder> model;
+  std::vector<float> input_data = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+  std::vector<int64_t> shape = {1, 3, 2};
+  std::vector<std::vector<int64_t>> output_shapes = {shape};
+  std::vector<std::vector<float>> output_values = {{3.0f, 6.0f, 9.0f, 12.0f, 15.0f, 18.0f}};
+
+  CreateModelInMemory(model,
+                      F32BuildAdd3Tensors(TestInputDef<float>(shape, false, input_data),
+                                          TestInputDef<float>(shape, false, input_data),
+                                          TestInputDef<float>(shape, false, input_data)));
+
+  ProviderOptions options;
+#if defined(_WIN32)
+  options["backend_path"] = "QnnCpu.dll";
+#else
+  options["backend_path"] = "libQnnCpu.so";
+#endif
+
+  Ort::SessionOptions session_opts;
+  session_opts.SetLogId("logger0");
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, session_opts, kQnnExecutionProvider, options);
+
+  ScopedOrtSession scoped(std::move(registered_ep_device),
+                          Ort::Session(*ort_env, model->model_data.data(), model->model_data.size(), session_opts));
+
+  std::vector<std::thread> threads;
+  constexpr int num_threads = 5;
+  constexpr int loop_count = 10;
+
+  for (int i = 0; i < num_threads; i++) {
+    threads.push_back(std::thread(RunSessionAndVerify, std::ref(scoped.session()), Ort::RunOptions{nullptr},
+                                  std::ref(model->builder.feeds_), output_shapes, output_values, loop_count));
+  }
+
+  for (auto& th : threads) {
+    th.join();
+  }
+}
+
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
+
+// Returns a function that builds a QDQ model that adds 3 tensors. Forces all scales and zero-points to be (1.0f, 0),
+// so it is only accurate when using non-fractional positive inputs.
+template <typename QuantType>
+static GetTestModelFn QDQBuildAdd3Tensors(const TestInputDef<float>& input0_def,
+                                          const TestInputDef<float>& input1_def,
+                                          const TestInputDef<float>& input2_def) {
+  return [input0_def, input1_def, input2_def](ModelTestBuilder& builder) {
+    builder.graph_->set_name("add3_qdq_graph");
+
+    MakeTestInput<float>(builder, "input0", input0_def);
+    auto qdq0_out = AddQDQNodePair<QuantType>(builder, "qdq0", "input0", 1.0f, 0);
+
+    MakeTestInput<float>(builder, "input1", input1_def);
+    auto qdq1_out = AddQDQNodePair<QuantType>(builder, "qdq1", "input1", 1.0f, 0);
+
+    // Fix bug: input2 must use input2_def (not input1_def).
+    MakeTestInput<float>(builder, "input2", input2_def);
+    auto qdq2_out = AddQDQNodePair<QuantType>(builder, "qdq2", "input2", 1.0f, 0);
+
+    builder.AddNode("Add0", "Add", {qdq0_out, qdq1_out}, {"add0_out"}, kOnnxDomain);
+
+    auto add0_qdq_out = AddQDQNodePair<QuantType>(builder, "add_qdq", "add0_out", 1.0f, 0);
+
+    builder.AddNode("Add1", "Add", {add0_qdq_out, qdq2_out}, {"add1_out"}, kOnnxDomain);
+
+    // op_output -> Q -> DQ -> output
+    auto final_out = AddQDQNodePairWithOutputAsGraphOutput<QuantType>(builder, "qdq_out", "add1_out", 1.0f, 0);
+  };
+}
+
+// Tests running a single session in multiple threads on the HTP backend.
+TEST_F(QnnHTPBackendTests, MultithreadSessionRun) {
+  std::unique_ptr<ModelAndBuilder> model;
+  std::vector<float> input_data = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+  std::vector<int64_t> shape = {1, 3, 2};
+  std::vector<std::vector<int64_t>> output_shapes = {shape};
+  std::vector<std::vector<float>> output_values = {{3.0f, 6.0f, 9.0f, 12.0f, 15.0f, 18.0f}};
+
+  CreateModelInMemory(model,
+                      QDQBuildAdd3Tensors<uint8_t>(TestInputDef<float>(shape, false, input_data),
+                                                   TestInputDef<float>(shape, false, input_data),
+                                                   TestInputDef<float>(shape, false, input_data)));
+
+  ProviderOptions options;
+#if defined(_WIN32)
+  options["backend_path"] = "QnnHtp.dll";
+#else
+  options["backend_path"] = "libQnnHtp.so";
+#endif
+  options["offload_graph_io_quantization"] = "0";
+
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+  // By default, 8 is used, which will impact time to run all
+  // unit tests due to overhead of thread creation/destruction
+  options["num_graph_prepare_threads"] = "1";
+#endif
+
+  Ort::SessionOptions session_opts;
+  session_opts.SetLogId("logger0");
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, session_opts, kQnnExecutionProvider, options);
+
+  ScopedOrtSession scoped(std::move(registered_ep_device),
+                          Ort::Session(*ort_env, model->model_data.data(), model->model_data.size(), session_opts));
+
+  std::vector<std::thread> threads;
+  constexpr int num_threads = 5;
+  constexpr int loop_count = 10;
+
+  for (int i = 0; i < num_threads; i++) {
+    threads.push_back(std::thread(RunSessionAndVerify, std::ref(scoped.session()), Ort::RunOptions{nullptr},
+                                  std::ref(model->builder.feeds_), output_shapes, output_values, loop_count));
+  }
+
+  for (auto& th : threads) {
+    th.join();
+  }
+}
+
+// Tests running a single session in multiple threads on the HTP backend with run option to set power config
+TEST_F(QnnHTPBackendTests, DISABLED_MultithreadHtpPowerCfgSessionRunOption) {
+  std::unique_ptr<ModelAndBuilder> model;
+  std::vector<float> input_data = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+  std::vector<int64_t> shape = {1, 3, 2};
+  std::vector<std::vector<int64_t>> output_shapes = {shape};
+  std::vector<std::vector<float>> output_values = {{3.0f, 6.0f, 9.0f, 12.0f, 15.0f, 18.0f}};
+
+  CreateModelInMemory(model,
+                      QDQBuildAdd3Tensors<uint8_t>(TestInputDef<float>(shape, false, input_data),
+                                                   TestInputDef<float>(shape, false, input_data),
+                                                   TestInputDef<float>(shape, false, input_data)));
+
+  ProviderOptions options;
+#if defined(_WIN32)
+  options["backend_path"] = "QnnHtp.dll";
+#else
+  options["backend_path"] = "libQnnHtp.so";
+#endif
+  options["offload_graph_io_quantization"] = "0";
+
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+  // By default, 8 is used, which will impact time to run all
+  // unit tests due to overhead of thread creation/destruction
+  options["num_graph_prepare_threads"] = "1";
+#endif
+
+  std::vector<std::string> perf_modes{
+      "burst", "balanced", "default", "high_performance", "high_power_saver",
+      "low_balanced", "extreme_power_saver", "low_power_saver", "power_saver"};
+
+  Ort::SessionOptions session_opts;
+  session_opts.SetLogId("logger0");
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, session_opts, kQnnExecutionProvider, options);
+
+  ScopedOrtSession scoped(std::move(registered_ep_device),
+                          Ort::Session(*ort_env, model->model_data.data(), model->model_data.size(), session_opts));
+
+  std::vector<std::thread> threads;
+  constexpr int num_threads = 5;
+  constexpr int loop_count = 10;
+
+  size_t post_i = perf_modes.size() - 1;
+  ASSERT_TRUE(post_i > num_threads);
+  for (int i = 0; i < num_threads; i++, post_i--) {
+    Ort::RunOptions run_opts;
+    run_opts.SetRunTag("logger0");
+    run_opts.AddConfigEntry("qnn.htp_perf_mode", perf_modes[i].c_str());
+    run_opts.AddConfigEntry("qnn.htp_perf_mode_post_run", perf_modes[post_i].c_str());
+    threads.push_back(std::thread(RunSessionAndVerify, std::ref(scoped.session()), std::move(run_opts),
+                                  std::ref(model->builder.feeds_), output_shapes, output_values, loop_count));
+  }
+
+  for (auto& th : threads) {
+    th.join();
+  }
+}
+
+// Tests running a single session in multiple threads on the HTP backend with EP option to set default power config
+TEST_F(QnnHTPBackendTests, MultithreadDefaultHtpPowerCfgFromEpOption) {
+  std::unique_ptr<ModelAndBuilder> model;
+  std::vector<float> input_data = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+  std::vector<int64_t> shape = {1, 3, 2};
+  std::vector<std::vector<int64_t>> output_shapes = {shape};
+  std::vector<std::vector<float>> output_values = {{3.0f, 6.0f, 9.0f, 12.0f, 15.0f, 18.0f}};
+
+  CreateModelInMemory(model,
+                      QDQBuildAdd3Tensors<uint8_t>(TestInputDef<float>(shape, false, input_data),
+                                                   TestInputDef<float>(shape, false, input_data),
+                                                   TestInputDef<float>(shape, false, input_data)));
+
+  ProviderOptions options;
+#if defined(_WIN32)
+  options["backend_path"] = "QnnHtp.dll";
+#else
+  options["backend_path"] = "libQnnHtp.so";
+#endif
+  options["offload_graph_io_quantization"] = "0";
+  options["htp_performance_mode"] = "burst";
+
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+  // By default, 8 is used, which will impact time to run all
+  // unit tests due to overhead of thread creation/destruction
+  options["num_graph_prepare_threads"] = "1";
+#endif
+
+  Ort::SessionOptions session_opts;
+  session_opts.SetLogId("logger0");
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, session_opts, kQnnExecutionProvider, options);
+
+  ScopedOrtSession scoped(std::move(registered_ep_device),
+                          Ort::Session(*ort_env, model->model_data.data(), model->model_data.size(), session_opts));
+
+  std::vector<std::thread> threads;
+  constexpr int num_threads = 5;
+  constexpr int loop_count = 10;
+  for (int i = 0; i < num_threads; i++) {
+    threads.push_back(std::thread(RunSessionAndVerify, std::ref(scoped.session()), Ort::RunOptions{nullptr},
+                                  std::ref(model->builder.feeds_), output_shapes, output_values, loop_count));
+  }
+
+  for (auto& th : threads) {
+    th.join();
+  }
+}
+
+// Tests running a single session in multiple threads on the HTP backend with EP option to set default power config to sustained high performance
+TEST_F(QnnHTPBackendTests, MultithreadSustainedHighPowerCfgFromEpOption) {
+  std::unique_ptr<ModelAndBuilder> model;
+  std::vector<float> input_data = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+  std::vector<int64_t> shape = {1, 3, 2};
+  std::vector<std::vector<int64_t>> output_shapes = {shape};
+  std::vector<std::vector<float>> output_values = {{3.0f, 6.0f, 9.0f, 12.0f, 15.0f, 18.0f}};
+
+  CreateModelInMemory(model,
+                      QDQBuildAdd3Tensors<uint8_t>(TestInputDef<float>(shape, false, input_data),
+                                                   TestInputDef<float>(shape, false, input_data),
+                                                   TestInputDef<float>(shape, false, input_data)));
+
+  ProviderOptions options;
+#if defined(_WIN32)
+  options["backend_path"] = "QnnHtp.dll";
+#else
+  options["backend_path"] = "libQnnHtp.so";
+#endif
+  options["offload_graph_io_quantization"] = "0";
+  options["htp_performance_mode"] = "sustained_high_performance";
+
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+  // By default, 8 is used, which will impact time to run all
+  // unit tests due to overhead of thread creation/destruction
+  options["num_graph_prepare_threads"] = "1";
+#endif
+
+  Ort::SessionOptions session_opts;
+  session_opts.SetLogId("logger0");
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, session_opts, kQnnExecutionProvider, options);
+
+  ScopedOrtSession scoped(std::move(registered_ep_device),
+                          Ort::Session(*ort_env, model->model_data.data(), model->model_data.size(), session_opts));
+
+  std::vector<std::thread> threads;
+  constexpr int num_threads = 5;
+  constexpr int loop_count = 10;
+  for (int i = 0; i < num_threads; i++) {
+    threads.push_back(std::thread(RunSessionAndVerify, std::ref(scoped.session()), Ort::RunOptions{nullptr},
+                                  std::ref(model->builder.feeds_), output_shapes, output_values, loop_count));
+  }
+
+  for (auto& th : threads) {
+    th.join();
+  }
+}
+
+// Tests running a single session in multiple threads on the HTP backend with
+// EP option to set default power config + run option to set power config for each run
+TEST_F(QnnHTPBackendTests, DISABLED_MultithreadHtpPowerCfgDefaultAndRunOption) {
+  std::unique_ptr<ModelAndBuilder> model;
+  std::vector<float> input_data = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+  std::vector<int64_t> shape = {1, 3, 2};
+  std::vector<std::vector<int64_t>> output_shapes = {shape};
+  std::vector<std::vector<float>> output_values = {{3.0f, 6.0f, 9.0f, 12.0f, 15.0f, 18.0f}};
+
+  CreateModelInMemory(model,
+                      QDQBuildAdd3Tensors<uint8_t>(TestInputDef<float>(shape, false, input_data),
+                                                   TestInputDef<float>(shape, false, input_data),
+                                                   TestInputDef<float>(shape, false, input_data)));
+
+  ProviderOptions options;
+#if defined(_WIN32)
+  options["backend_path"] = "QnnHtp.dll";
+#else
+  options["backend_path"] = "libQnnHtp.so";
+#endif
+  options["offload_graph_io_quantization"] = "0";
+  options["htp_performance_mode"] = "burst";
+
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+  // By default, 8 is used, which will impact time to run all
+  // unit tests due to overhead of thread creation/destruction
+  options["num_graph_prepare_threads"] = "1";
+#endif
+
+  std::vector<std::string> perf_modes{
+      "burst", "balanced", "default", "high_performance", "high_power_saver",
+      "low_balanced", "extreme_power_saver", "low_power_saver", "power_saver"};
+
+  Ort::SessionOptions session_opts;
+  session_opts.SetLogId("logger0");
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, session_opts, kQnnExecutionProvider, options);
+
+  ScopedOrtSession scoped(std::move(registered_ep_device),
+                          Ort::Session(*ort_env, model->model_data.data(), model->model_data.size(), session_opts));
+
+  std::vector<std::thread> threads;
+  constexpr int num_threads = 5;
+  constexpr int loop_count = 10;
+
+  size_t post_i = perf_modes.size() - 1;
+  ASSERT_TRUE(post_i > num_threads);
+  for (int i = 0; i < num_threads; i++, post_i--) {
+    Ort::RunOptions run_opts;
+    run_opts.SetRunTag("logger0");
+    run_opts.AddConfigEntry("qnn.htp_perf_mode", perf_modes[i].c_str());
+    run_opts.AddConfigEntry("qnn.htp_perf_mode_post_run", perf_modes[post_i].c_str());
+    threads.push_back(std::thread(RunSessionAndVerify, std::ref(scoped.session()), std::move(run_opts),
+                                  std::ref(model->builder.feeds_), output_shapes, output_values, loop_count));
+  }
+
+  for (auto& th : threads) {
+    th.join();
+  }
+}
+
+// Test shape inference of QDQ NHWC Resize operator (opset 18) that uses
+// the sizes input. Use the QNN HTP backend.
+// Maps to QNN's ResizeBilinear operator.
+TEST_F(QnnHTPBackendTests, TestNHWCResizeShapeInference_qdq_sizes_opset18) {
+  RunNHWCResizeModel(ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.quant.onnx", TestBackend::Htp);
+}
+
+// Test that QNN Ir generates the expected DLC file for a model meant to run on the QNN HTP backend,
+// using the HTP backend's validator.
+TEST_F(QnnHTPBackendTests, QnnIr_HtpValidator_OutputFiles) {
+  BackendSupport ir_backend_support = IsIRBackendSupported();
+  if (ir_backend_support == BackendSupport::UNSUPPORTED) {
+    GTEST_SKIP() << "QNN IR backend is not available! Skipping test.";
+  }
+  ASSERT_NE(ir_backend_support, BackendSupport::SUPPORT_ERROR) << "Failed to check if QNN IR backend is available.";
+
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+
+  const std::filesystem::path qnn_dlc_dir = kDlcOutputDir;
+
+  // Remove pre-existing QNN Ir output files. Note that fs::remove_all() can handle non-existing paths.
+  std::filesystem::remove_all(qnn_dlc_dir);
+  ASSERT_FALSE(std::filesystem::exists(qnn_dlc_dir));
+
+  auto scoped = InitNHWCResizeModel(ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.onnx",
+                                    TestBackend::Htp,  // backend (also used as the validator)
+                                    TestBackend::Ir);  // serializer backend
+
+  // File names are taken from graph node names. Just make sure that we got one .dlc
+  // in the expected directory.
+  ASSERT_TRUE(std::filesystem::exists(qnn_dlc_dir));
+
+  int file_count = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(qnn_dlc_dir)) {
+    EXPECT_TRUE(entry.is_regular_file());
+    EXPECT_EQ(entry.path().extension(), ".dlc");
+    ++file_count;
+  }
+  EXPECT_EQ(file_count, 1);
+}
+
+#if defined(__linux__) && !defined(__aarch64__)
+// Dumps a single ScatterElements(reduction=max) model -- a v73+ op the device-less HTP validator
+// rejects -- to DLC. Rejection is silent (the op drops to CPU, no throw), so the .dlc count is the
+// only signal: 0 = rejected, 1 = accepted onto QNN.
+static int CountScatterElementsMaxDlcFiles(const std::filesystem::path& qnn_dlc_dir,
+                                           bool skip_backend_op_validation) {
+  std::filesystem::remove_all(qnn_dlc_dir);
+
+  ModelTestBuilder helper;
+  // `data` must be a runtime input, else ORT constant-folds ScatterElements away before the EP sees it.
+  std::vector<float> data(8, 0.0f);
+  helper.MakeInput<float>("data", {8}, data);
+  helper.MakeInitializer<int64_t>("indices", {1}, {0});
+  helper.MakeInitializer<float>("updates", {1}, {1.0f});
+  helper.AddNode("scatter", "ScatterElements", {"data", "indices", "updates"}, {"Y"}, kOnnxDomain,
+                 {test::MakeAttribute("reduction", std::string("max"))});
+  helper.MakeOutput("Y");
+
+  const std::unordered_map<std::string, int> domain_to_version = {{"", 18}, {kMSDomain, 1}};
+  for (const auto& [domain, version] : domain_to_version) {
+    const gsl::not_null<ONNX_NAMESPACE::OperatorSetIdProto*> opset_id_proto{helper.model_.add_opset_import()};
+    opset_id_proto->set_domain(domain);
+    opset_id_proto->set_version(version);
+  }
+  helper.model_.set_ir_version(ONNX_NAMESPACE::Version::IR_VERSION);
+
+  std::string model_data;
+  helper.model_.SerializeToString(&model_data);
+
+  ProviderOptions options;
+  options["backend_path"] = "libQnnHtp.so";
+  options["offload_graph_io_quantization"] = "0";
+  options["dump_qnn_ir_dlc"] = "1";
+  options["dump_qnn_ir_dlc_dir"] = qnn_dlc_dir.string();
+  options["qnn_ir_backend_path"] = "libQnnIr.so";
+  if (skip_backend_op_validation) {
+    options["skip_backend_op_validation"] = "1";
+  }
+
+  Ort::SessionOptions so;
+  so.SetGraphOptimizationLevel(ORT_ENABLE_ALL);
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, options);
+  ScopedOrtSession scoped(std::move(registered_ep_device),
+                          Ort::Session(*ort_env, model_data.data(), model_data.size(), so));
+
+  if (!std::filesystem::exists(qnn_dlc_dir)) {
+    return 0;
+  }
+  int file_count = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(qnn_dlc_dir)) {
+    if (entry.is_regular_file() && entry.path().extension() == ".dlc") {
+      ++file_count;
+    }
+  }
+  return file_count;
+}
+
+// Real A/B regression test for skip_backend_op_validation, valid ONLY on a device-less x86_64 Linux
+// host. There the HTP backend validates op configs against a static, arch-agnostic op table (no NPU
+// bound) and over-rejects v73+ ops such as ScatterElements(reduction=max) -- the #438 regression.
+// On real HTP hardware the validator is device-bound and accepts the op, so flag-off and flag-on
+// would behave identically; hence the x86_64-only guard.
+TEST_F(QnnHTPBackendTests, QnnIr_ScatterElementsMax_SkipBackendOpValidation_AB) {
+  BackendSupport ir_backend_support = IsIRBackendSupported();
+  if (ir_backend_support == BackendSupport::UNSUPPORTED) {
+    GTEST_SKIP() << "QNN IR backend is not available! Skipping test.";
+  }
+  ASSERT_NE(ir_backend_support, BackendSupport::SUPPORT_ERROR) << "Failed to check if QNN IR backend is available.";
+
+  const std::filesystem::path qnn_dlc_dir = kDlcOutputDir;
+
+  // Flag off (#438 regression): backend validator rejects the op -> no QNN partition -> no DLC.
+  EXPECT_EQ(CountScatterElementsMaxDlcFiles(qnn_dlc_dir, /*skip_backend_op_validation*/ false), 0);
+
+  // Flag on (the fix): generic validation accepts the op -> it stays on QNN -> one DLC.
+  EXPECT_EQ(CountScatterElementsMaxDlcFiles(qnn_dlc_dir, /*skip_backend_op_validation*/ true), 1);
+}
+#endif  // defined(__linux__) && !defined(__aarch64__)
+
+// Test that QNN Saver generates the expected files for a model meant to run on the QNN HTP backend.
+TEST_F(QnnHTPBackendTests, DISABLED_QnnSaver_OutputFiles) {
+  const std::filesystem::path qnn_saver_output_dir = "saver_output";
+
+  // Remove pre-existing QNN Saver output files. Note that fs::remove_all() can handle non-existing paths.
+  std::filesystem::remove_all(qnn_saver_output_dir);
+  ASSERT_FALSE(std::filesystem::exists(qnn_saver_output_dir));
+
+  RunNHWCResizeModel(ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.onnx",
+                     TestBackend::Htp,     // backend
+                     TestBackend::Saver);  // serializer_backend
+
+  // Check that QNN Saver output files exist.
+  EXPECT_TRUE(std::filesystem::exists(qnn_saver_output_dir / "saver_output.c"));
+  EXPECT_TRUE(std::filesystem::exists(qnn_saver_output_dir / "params.bin"));
+}
+
+// Test that models run with various HTP graph finalization optimization modes.
+TEST_F(QnnHTPBackendTests, HTPGraphFinalizationOptimizationModes) {
+  constexpr std::array<const char*, 5> graph_opt_modes = {"",    // No explicit mode specified
+                                                          "0",   // Explicit default mode
+                                                          "1",   // Mode 1
+                                                          "2",   // Mode 2
+                                                          "3"};  // Mode 3
+  for (auto mode : graph_opt_modes) {
+    RunNHWCResizeModel(ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.quant.onnx",
+                       TestBackend::Htp,  // backend
+                       std::nullopt,      // serializer_backend
+                       mode);             // htp_graph_finalization_opt_mode
+  }
+}
+
+// Test that models run with various SoC model values
+TEST_F(QnnHTPBackendTests, HTPSocModels) {
+  const std::array<std::string, 3> soc_models = {"",  // No explicit SoC model specified
+                                                 std::to_string(QNN_SOC_MODEL_UNKNOWN),
+#if defined(_M_ARM64)
+                                                 std::to_string(QNN_SOC_MODEL_SC8280X)};
+#elif defined(__linux__)
+                                                 std::to_string(QNN_SOC_MODEL_SM8350)};
+#else
+                                                 ""};
+#endif
+
+  for (auto soc_model : soc_models) {
+    RunNHWCResizeModel(ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.quant.onnx",
+                       TestBackend::Htp,  // backend
+                       std::nullopt,      // serializer_backend
+                       "",                // htp_graph_finalization_opt_mode
+                       "",                // qnn_context_priority
+                       soc_model);
+  }
+}
+
+// Test that models run with various HTP architecture values (and set device_id)
+TEST_F(QnnHTPBackendTests, HTPArchValues) {
+  constexpr std::array<const char*, 3> htp_archs = {"",     // No explicit arch specified
+                                                    "0",    // "None"
+                                                    "68"};  // v68
+  for (auto htp_arch : htp_archs) {
+    RunNHWCResizeModel(ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.quant.onnx",
+                       TestBackend::Htp,  // backend
+                       std::nullopt,      // enable_qnn_saver
+                       "",                // htp_graph_finalization_opt_mode
+                       "",                // qnn_context_priority
+                       "",                // soc_model
+                       htp_arch,          // htp_arch
+                       "0");              // device_id
+  }
+}
+
+// Test that models run with high QNN context priority.
+TEST_F(QnnHTPBackendTests, QnnContextPriorityHigh) {
+  RunNHWCResizeModel(ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.quant.onnx",
+                     TestBackend::Htp,  // use_htp
+                     std::nullopt,      // enable_qnn_saver
+                     "",                // htp_graph_finalization_opt_mode
+                     "high");           // qnn_context_priority
+}
+
+// Create a model with Cast + Add (quantized)
+// cast_input -> Cast -> Q -> DQ ----
+//                                   |
+//             input2 -> Q -> DQ -> Add -> Q -> DQ -> output
+template <typename InputType, typename QuantType>
+static GetTestQDQModelFn<QuantType> BuildCastAddQDQTestCase() {
+  return [](ModelTestBuilder& builder, std::vector<QuantParams<QuantType>>& output_qparams) {
+    builder.graph_->set_name("cast_add_qdq_graph");
+
+    MakeTestInput<InputType>(builder, "cast_input", TestInputDef<InputType>({2, 3}, false, {0, 1, 0, 1, 0, 1}));
+
+    const std::vector<float> add_input2_data = {0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f};
+    MakeTestInput<float>(builder, "add_input2", TestInputDef<float>({2, 3}, false, add_input2_data));
+
+    builder.AddNode(
+        "Cast",
+        "Cast",
+        {"cast_input"},
+        {"cast_output"},
+        kOnnxDomain,
+        {builder.MakeScalarAttribute("to", static_cast<int64_t>(ONNX_NAMESPACE::TensorProto_DataType::TensorProto_DataType_FLOAT))});
+
+    // Quant params derived from expected Add input range.
+    gsl::span<const float> data_range = gsl::make_span(add_input2_data);
+    QuantParams<QuantType> q_parameter = GetDataQuantParams<QuantType>(data_range);
+
+    auto cast_qdq_out = AddQDQNodePair<QuantType>(builder, "cast_qdq", "cast_output", q_parameter.scale, q_parameter.zero_point);
+    auto add_in2_qdq_out = AddQDQNodePair<QuantType>(builder, "add_in2_qdq", "add_input2", q_parameter.scale, q_parameter.zero_point);
+
+    builder.AddNode("Add", "Add", {cast_qdq_out, add_in2_qdq_out}, {"add_output"}, kOnnxDomain);
+
+    // add_output -> Q -> DQ -> output
+    auto output = AddQDQNodePairWithOutputAsGraphOutput<QuantType>(builder, "out_qdq", "add_output",
+                                                                   output_qparams[0].scale, output_qparams[0].zero_point);
+  };
+}
+
+template <typename InputType>
+static GetTestModelFn BuildCastAddTestCase() {
+  return [](ModelTestBuilder& builder) {
+    builder.graph_->set_name("cast_add_graph");
+
+    MakeTestInput<InputType>(builder, "cast_input", TestInputDef<InputType>({2, 3}, false, {0, 1, 0, 1, 0, 1}));
+    MakeTestInput<float>(builder, "add_input2", TestInputDef<float>({2, 3}, false, {0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f}));
+
+    builder.AddNode(
+        "Cast",
+        "Cast",
+        {"cast_input"},
+        {"cast_output"},
+        kOnnxDomain,
+        {builder.MakeScalarAttribute("to", static_cast<int64_t>(ONNX_NAMESPACE::TensorProto_DataType::TensorProto_DataType_FLOAT))});
+
+    builder.AddNode("Add", "Add", {"cast_output", "add_input2"}, {"output"}, kOnnxDomain);
+
+    builder.MakeOutput("output");
+  };
+}
+
+void VerifyFileExistsAndIsNonEmpty(const std::string& filepath) {
+  std::ifstream csv_file(filepath, std::ifstream::binary);
+  ASSERT_TRUE(csv_file.good());
+
+  csv_file.seekg(0, csv_file.end);
+  size_t buffer_size = static_cast<size_t>(csv_file.tellg());
+  EXPECT_NE(0, buffer_size);
+}
+
+TEST_F(QnnHTPBackendTests, ProfilingTest) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+#if defined(_WIN32)
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+#endif
+#if defined(__linux__) && !defined(__aarch64__)
+  provider_options["soc_model"] = std::to_string(QNN_SOC_MODEL_SM8850);
+#endif
+  provider_options["enable_htp_fp16_precision"] = "1";
+  provider_options["profiling_level"] = "detailed";
+  provider_options["profiling_file_path"] = "detailed_profile.csv";
+
+  auto input_defs = {TestInputDef<float>({1, 2, 2, 2}, false, -10.0f, 10.0f),
+                     TestInputDef<float>({1, 2, 2, 2}, false, -10.0f, 10.0f)};
+  RunQnnModelTest(BuildOpTestCase<float>("Add_node", "Add", input_defs, {}, {}, kOnnxDomain),
+                  provider_options,
+                  13,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(0.008f)});
+
+  VerifyFileExistsAndIsNonEmpty(provider_options["profiling_file_path"]);
+  std::remove(provider_options["profiling_file_path"].c_str());
+
+#if QNN_API_VERSION_MAJOR > 2 || \
+    (QNN_API_VERSION_MAJOR == 2 && (QNN_API_VERSION_MINOR >= 29))
+  VerifyFileExistsAndIsNonEmpty("detailed_profile_qnn.log");
+  std::remove("detailed_profile_qnn.log");
+#endif
+}
+
+TEST_F(QnnHTPBackendTests, OptraceTest) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+#if defined(_WIN32)
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+#endif
+#if defined(__linux__) && !defined(__aarch64__)
+  provider_options["soc_model"] = std::to_string(QNN_SOC_MODEL_SM8850);
+#endif
+  provider_options["enable_htp_fp16_precision"] = "1";
+  provider_options["profiling_level"] = "optrace";
+  provider_options["profiling_file_path"] = "optrace_profile.csv";
+
+  auto input_defs = {TestInputDef<float>({1, 2, 2, 2}, false, -10.0f, 10.0f),
+                     TestInputDef<float>({1, 2, 2, 2}, false, -10.0f, 10.0f)};
+  RunQnnModelTest(BuildOpTestCase<float>("Add_node", "Add", input_defs, {}, {}, kOnnxDomain),
+                  provider_options,
+                  13,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(0.008f)});
+
+  VerifyFileExistsAndIsNonEmpty(provider_options["profiling_file_path"]);
+  std::remove(provider_options["profiling_file_path"].c_str());
+
+  std::cout << "DEBUG: " << __FILE__ << " " << __LINE__ << std::endl;
+#if QNN_API_VERSION_MAJOR > 2 || \
+    (QNN_API_VERSION_MAJOR == 2 && (QNN_API_VERSION_MINOR >= 29))
+  VerifyFileExistsAndIsNonEmpty("optrace_profile_qnn.log");
+  std::cout << "DEBUG: " << __FILE__ << " " << __LINE__ << std::endl;
+  if (std::remove("optrace_profile_qnn.log") != 0)
+    std::cout << "DEBUG: " << __FILE__ << " " << __LINE__ << std::endl;
+#endif
+}
+
+TEST_F(QnnHTPBackendTests, CastAddQDQU8) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+
+  TestQDQModelAccuracy<uint8_t>(BuildCastAddTestCase<uint8_t>(),
+                                BuildCastAddQDQTestCase<uint8_t, uint8_t>(),
+                                provider_options,
+                                21,
+                                ExpectedEPNodeAssignment::All);
+}
+
+TEST_F(QnnHTPBackendTests, CastAddQDQU16) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+
+  TestQDQModelAccuracy<uint16_t>(BuildCastAddTestCase<uint8_t>(),
+                                 BuildCastAddQDQTestCase<uint8_t, uint16_t>(),
+                                 provider_options,
+                                 21,
+                                 ExpectedEPNodeAssignment::All);
+}
+
+TEST_F(QnnHTPBackendTests, CastAddQDQS8) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+
+  TestQDQModelAccuracy<int8_t>(BuildCastAddTestCase<uint8_t>(),
+                               BuildCastAddQDQTestCase<uint8_t, int8_t>(),
+                               provider_options,
+                               21,
+                               ExpectedEPNodeAssignment::All);
+}
+
+TEST_F(QnnHTPBackendTests, CastAddQDQS16) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+
+  TestQDQModelAccuracy<int16_t>(BuildCastAddTestCase<uint8_t>(),
+                                BuildCastAddQDQTestCase<uint8_t, int16_t>(),
+                                provider_options,
+                                21,
+                                // QNN has not yet supported S16 Quantize/Dequantize
+                                ExpectedEPNodeAssignment::Some);
+}
+
+// Test float32 model with FP16 precision
+TEST_F(QnnHTPBackendTests, Float32ModelWithFP16PrecisionTest) {
+  ProviderOptions provider_options;
+#if defined(_WIN32)
+  provider_options["backend_path"] = "QnnHtp.dll";
+#else
+  provider_options["backend_path"] = "libQnnHtp.so";
+#endif
+#if defined(_WIN32)
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+#endif
+#if defined(__linux__) && !defined(__aarch64__)
+  provider_options["soc_model"] = std::to_string(QNN_SOC_MODEL_SM8850);
+#endif
+  provider_options["enable_htp_fp16_precision"] = "1";
+
+  auto input_defs = {TestInputDef<float>({1, 2, 2, 2}, false, -10.0f, 10.0f),
+                     TestInputDef<float>({1, 2, 2, 2}, false, -10.0f, 10.0f)};
+  RunQnnModelTest(BuildOpTestCase<float>("Add_node", "Add", input_defs, {}, {}, kOnnxDomain),
+                  provider_options,
+                  13,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(0.008f)});
+}
+
+// Test that QNN EP only handles nodes with static shapes and rejects nodes with dynamic shape I/O.
+TEST_F(QnnHTPBackendTests, EPRejectsDynamicShapesF32) {
+  // Local function that builds a model in which the last two nodes use dynamic shapes.
+  auto model_build_fn = [](ModelTestBuilder& builder) {
+    builder.graph_->set_name("ep_rejects_dynamic_shapes_f32_graph");
+
+    builder.MakeInput<float>("input1",
+                             std::vector<int64_t>{1, 2, 8, 8},
+                             GetFloatDataInRange(0.0f, 1.0f, 128));
+    builder.MakeInput<int64_t>("input2",
+                               std::vector<int64_t>{3},
+                               std::vector<int64_t>{1, 2, 49});
+
+    builder.MakeInitializer<float>("weight",
+                                   std::vector<int64_t>{2, 2, 2, 2},
+                                   GetFloatDataInRange(-0.3f, 0.3f, 16));
+    builder.MakeInitializer<float>("bias",
+                                   std::vector<int64_t>{2},
+                                   {0.0f, 1.0f});
+
+    // Conv with known shapes. QNN EP should support it.
+    builder.AddNode("Conv", "Conv", {"input1", "weight", "bias"}, {"conv_output"}, kOnnxDomain);
+
+    // Reshape to a dynamic shape. QNN EP should reject this node.
+    builder.AddNode("Reshape", "Reshape", {"conv_output", "input2"}, {"reshape_output"}, kOnnxDomain);
+
+    // Softmax should be rejected because its input has a dynamic shape.
+    builder.AddNode("Softmax", "Softmax", {"reshape_output"}, {"output"}, kOnnxDomain);
+
+    builder.MakeOutput("output");
+  };
+
+  // Local function that checks that the nodes with dynamic shape I/O were assigned to CPU EP.
+  std::function<void(const Ort::Session&)> ep_graph_checker = [](const Ort::Session& session) {
+    std::vector<Ort::ConstEpAssignedSubgraph> subgraphs = session.GetEpGraphAssignmentInfo();
+    for (const auto& subgraph : subgraphs) {
+      std::string ep_name = subgraph.GetEpName();
+      for (const auto& node : subgraph.GetNodes()) {
+        std::string op_type = node.GetOperatorType();
+        if (op_type == "Reshape" || op_type == "Softmax") {
+          EXPECT_EQ(ep_name, kCpuExecutionProvider) << op_type << " should be assigned to CPU EP";
+        } else {
+          EXPECT_EQ(ep_name, kQnnExecutionProvider) << op_type << " should be assigned to QNN EP";
+        }
+      }
+    }
+  };
+
+  ProviderOptions provider_options;
+#if defined(_WIN32)
+  provider_options["backend_path"] = "QnnHtp.dll";
+#else
+  provider_options["backend_path"] = "libQnnHtp.so";
+#endif
+  provider_options["offload_graph_io_quantization"] = "0";
+#if defined(_WIN32)
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+#endif
+#if defined(__linux__) && !defined(__aarch64__)
+  provider_options["soc_model"] = std::to_string(QNN_SOC_MODEL_SM8850);
+#endif
+  provider_options["enable_htp_fp16_precision"] = "1";
+
+  RunQnnModelTest(model_build_fn,
+                  provider_options,
+                  /*opset*/ 19,
+                  EPVerificationParams{ExpectedEPNodeAssignment::Some, ElementwiseAbsoluteVerifier(1e-4f),
+                                       &ep_graph_checker},
+                  OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR,
+                  /*verify_output*/ true);
+}
+
+TEST_F(QnnHTPBackendTests, DumpJsonQNNGraph) {
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.quant.onnx";
+  ProviderOptions options;
+#if defined(_WIN32)
+  options["backend_path"] = "QnnHtp.dll";
+#else
+  options["backend_path"] = "libQnnHtp.so";
+#endif
+  options["offload_graph_io_quantization"] = "0";
+
+  const std::filesystem::path dump_dir = "test_qnn_graphs_";
+  options["json_qnn_graph_dir"] = dump_dir.string();
+  options["dump_json_qnn_graph"] = "1";
+
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+  // By default, 8 is used, which will impact time to run all
+  // unit tests due to overhead of thread creation/destruction
+  options["num_graph_prepare_threads"] = "1";
+#endif
+
+  // Remove pre-existing json files. Note that fs::remove_all() can handle non-existing paths.
+  std::filesystem::remove_all(dump_dir);
+  ASSERT_TRUE(std::filesystem::create_directory(dump_dir));
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  Ort::SessionOptions so;
+  RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, options);
+
+  ScopedOrtSession scoped(std::move(registered_ep_device), Ort::Session(*ort_env, ort_model_path, so));
+
+  // Check that QNN JSON file(s) exist.
+  bool has_a_json_file = false;
+  for (auto const& dir_entry : std::filesystem::directory_iterator{dump_dir}) {
+    EXPECT_TRUE(dir_entry.is_regular_file());
+    EXPECT_EQ(dir_entry.path().extension().string(), ".json");
+    has_a_json_file = true;
+  }
+  EXPECT_TRUE(has_a_json_file);
+
+  // Cleaup generated files.
+  // Comment the following line to inspect generated JSON files.
+  std::filesystem::remove_all(dump_dir);
+}
+
+// Test option for offloading quantization of graph inputs and dequantization of graph outputs to the CPU EP.
+TEST_F(QnnHTPBackendTests, EPOffloadsGraphIOQuantDequant) {
+  // Returns a function that checks that the Q/DQ ops at the graph IO boundary are offloaded to CPU
+  // if the corresponding provider option is enabled.
+  auto graph_checker_builder = [](bool offload_graph_io_quantization) -> std::function<void(const Ort::Session&)> {
+    return [offload_graph_io_quantization](const Ort::Session& session) {
+      // The public API returns pre-fusion nodes grouped by EP subgraph.
+      // We verify:
+      //   offload=0: exactly 1 QNN subgraph (all QNN-eligible ops grouped), 0 CPU nodes
+      //   offload=1: exactly 1 QNN subgraph (all QNN-eligible ops grouped), 2 CPU nodes (boundary Q + DQ)
+      size_t num_qnn_subgraphs = 0;
+      size_t num_cpu_nodes = 0;
+      std::vector<std::string> cpu_op_types;
+
+      // For offload=1 verify the CPU Q/DQ are the graph-IO boundary nodes, not interior ones.
+      // ConstEpAssignedNode exposes only GetName/GetDomain/GetOperatorType — no input/output
+      // tensor name accessors — so we proxy the boundary check via the node names assigned by
+      // AddQDQNodePair / AddQDQNodePairWithOutputAsGraphOutput in BuildQDQOpTestCase:
+      //   input-side boundary Q   → "qdq_in0_q"  (consumes graph input "quant_input_defs_0")
+      //   output-side boundary DQ → "qdq_out_dq" (produces graph output "qdq_out_dq_out")
+      // Interior counterparts are "qdq_in0_dq" and "qdq_out_q"; ending up on CPU would mean
+      // the partitioner sent the wrong nodes to the CPU EP.
+      bool found_boundary_q = false;
+      bool found_boundary_dq = false;
+
+      std::vector<Ort::ConstEpAssignedSubgraph> subgraphs = session.GetEpGraphAssignmentInfo();
+      for (const auto& subgraph : subgraphs) {
+        std::string ep_name = subgraph.GetEpName();
+        if (ep_name == kQnnExecutionProvider) {
+          num_qnn_subgraphs++;
+        } else {
+          // CPU EP should only receive Q/DQ boundary nodes when offloading is enabled.
+          for (const auto& node : subgraph.GetNodes()) {
+            std::string op_type = node.GetOperatorType();
+            std::string node_name = node.GetName();
+            cpu_op_types.push_back(op_type);
+            if (offload_graph_io_quantization) {
+              EXPECT_TRUE(op_type == "QuantizeLinear" || op_type == "DequantizeLinear")
+                  << op_type << " should not be on CPU EP when IO quantization offloading is enabled";
+              if (op_type == "QuantizeLinear") {
+                found_boundary_q = (node_name == "qdq_in0_q");
+              } else if (op_type == "DequantizeLinear") {
+                found_boundary_dq = (node_name == "qdq_out_dq");
+              }
+            }
+            num_cpu_nodes++;
+          }
+        }
+      }
+
+      EXPECT_EQ(num_qnn_subgraphs, 1u) << "Expected all QNN-assigned nodes grouped into 1 subgraph";
+      if (offload_graph_io_quantization) {
+        const std::vector<std::string> graph_inputs = session.GetInputNames();
+        const std::vector<std::string> graph_outputs = session.GetOutputNames();
+        EXPECT_EQ(num_cpu_nodes, 2u) << "Expected 2 boundary Q/DQ nodes offloaded to CPU EP";
+        EXPECT_TRUE(found_boundary_q)
+            << "Expected input-side boundary Q (qdq_in0_q) on CPU EP consuming a graph input; "
+            << "graph inputs: " << testing::PrintToString(graph_inputs);
+        EXPECT_TRUE(found_boundary_dq)
+            << "Expected output-side boundary DQ (qdq_out_dq) on CPU EP producing a graph output; "
+            << "graph outputs: " << testing::PrintToString(graph_outputs);
+      } else {
+        EXPECT_EQ(num_cpu_nodes, 0u) << "Expected no CPU nodes when IO quantization offloading is disabled, "
+                                     << "got: " << testing::PrintToString(cpu_op_types);
+      }
+    };
+  };
+
+  ProviderOptions provider_options;
+#if defined(_WIN32)
+  provider_options["backend_path"] = "QnnHtp.dll";
+#else
+  provider_options["backend_path"] = "libQnnHtp.so";
+#endif
+  const std::vector<std::string> op_types = {
+      "Sigmoid",
+      "Transpose",
+      "Softmax",
+      "Sqrt",
+      "Elu",
+  };
+
+  // Test various QDQ ops with offloading of I/O quantization enabled and disabled.
+  for (auto op_type : op_types) {
+    for (int offload_io_quant = 0; offload_io_quant <= 1; offload_io_quant++) {
+      provider_options["offload_graph_io_quantization"] = offload_io_quant ? "1" : "0";
+      auto graph_checker = graph_checker_builder(offload_io_quant != 0);
+      auto expected_ep_assignment = offload_io_quant ? ExpectedEPNodeAssignment::Some : ExpectedEPNodeAssignment::All;
+
+      float min_val = (op_type == "Sqrt") ? 0.0f : -10.0f;
+      TestInputDef<float> input_def({1, 2, 2, 2}, false, GetFloatDataInRange(min_val, 10.0f, 8));
+      auto f32_model_build_fn = BuildOpTestCase<float>(op_type + "_node", op_type, {input_def}, {}, {});
+      auto qdq_model_build_fn = BuildQDQOpTestCase<uint8_t>(op_type + "_node", op_type, {input_def}, {}, {});
+      TestQDQModelAccuracy<uint8_t>(f32_model_build_fn,
+                                    qdq_model_build_fn,
+                                    provider_options,
+                                    /*opset*/ 21,
+                                    expected_ep_assignment,
+                                    /*abs_err*/ QDQTolerance(),
+                                    OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR,
+                                    /*qnn_ctx_model_path*/ "",
+                                    /*session_option_pairs*/ {},
+                                    /*graph_optimization_level*/ std::nullopt,
+                                    &graph_checker);
+    }
+  }
+}
+
+// Returns a function that builds a QDQ Sigmoid model for testing tensor name overrides.
+template <typename QuantType>
+static GetTestModelFn QDQBuildSigmoidForTensorNameTest(const TestInputDef<float>& input_def) {
+  return [input_def](ModelTestBuilder& builder) {
+    builder.graph_->set_name("sigmoid_qdq_graph");
+
+    MakeTestInput<float>(builder, "input", input_def);
+
+    float scale = 1.0f / 255.0f;
+    QuantType zero_point = 0;
+
+    auto qdq_input_out = AddQDQNodePair<QuantType>(builder, "qdq_input", "input", scale, zero_point);
+
+    builder.AddNode("Sigmoid", "Sigmoid", {qdq_input_out}, {"sigmoid_out"}, kOnnxDomain);
+
+    // op_output -> Q -> DQ -> output
+    auto final_out = AddQDQNodePairWithOutputAsGraphOutput<QuantType>(builder, "qdq_output", "sigmoid_out", scale, zero_point);
+  };
+}
+
+// Test that DLC I/O tensor names match original ONNX names when offload_graph_io_quantization=1.
+TEST_F(QnnHTPBackendTests, OffloadGraphIoQuantizationTensorNameOverrides) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  ProviderOptions provider_options;
+#if defined(_WIN32)
+  provider_options["backend_path"] = "QnnHtp.dll";
+#else
+  provider_options["backend_path"] = "libQnnHtp.so";
+#endif
+  provider_options["offload_graph_io_quantization"] = "1";
+
+  const std::filesystem::path dump_dir = "OffloadGraphIoQuantizationTensorNameOverrides";
+  provider_options["json_qnn_graph_dir"] = dump_dir.string();
+  provider_options["dump_json_qnn_graph"] = "1";
+
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+  // By default, 8 is used, which will impact time to run all
+  // unit tests due to overhead of thread creation/destruction
+  provider_options["num_graph_prepare_threads"] = "1";
+#endif
+
+  // Remove pre-existing json files. Note that fs::remove_all() can handle non-existing paths.
+  std::filesystem::remove_all(dump_dir);
+  ASSERT_TRUE(std::filesystem::create_directory(dump_dir));
+
+  auto cleanup = gsl::finally([&dump_dir]() { std::filesystem::remove_all(dump_dir); });
+
+  // Build QDQ Sigmoid model using custom builder function
+  std::vector<int64_t> shape = {1, 2, 2, 2};
+  std::vector<float> input_data = GetFloatDataInRange(0.0f, 1.0f, 8);
+  TestInputDef<float> input_def(shape, false, input_data);
+
+  std::unique_ptr<ModelAndBuilder> model;
+  CreateModelInMemory(model, QDQBuildSigmoidForTensorNameTest<uint8_t>(input_def), 21);
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  Ort::SessionOptions so;
+  so.SetGraphOptimizationLevel(ORT_ENABLE_ALL);
+  RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, provider_options);
+
+  ScopedOrtSession scoped(std::move(registered_ep_device), Ort::Session(*ort_env, model->model_data.data(), model->model_data.size(), so));
+
+  // Find the JSON graph file
+  std::filesystem::path json_file_path;
+  for (const auto& dir_entry : std::filesystem::directory_iterator{dump_dir}) {
+    if (dir_entry.is_regular_file() && dir_entry.path().extension().string() == ".json" &&
+        dir_entry.path().filename().string().find("_tensor_log") == std::string::npos) {
+      json_file_path = dir_entry.path();
+      break;
+    }
+  }
+  ASSERT_FALSE(json_file_path.empty()) << "No JSON graph file found in " << dump_dir;
+
+  // Parse JSON and extract tensor names
+  std::set<std::string> tensor_names;
+  {
+    std::ifstream json_file(json_file_path);
+    ASSERT_TRUE(json_file.is_open()) << "Failed to open JSON file: " << json_file_path;
+
+    nlohmann::json root_json;
+    json_file >> root_json;
+
+    ASSERT_TRUE(root_json.contains("graph")) << "JSON missing 'graph' field";
+    const auto& graph_json = root_json["graph"];
+    ASSERT_TRUE(graph_json.contains("tensors")) << "JSON graph missing 'tensors' field";
+
+    for (const auto& [name, tensor] : graph_json["tensors"].items()) {
+      tensor_names.insert(name);
+    }
+  }
+
+  // Verify original ONNX names appear in DLC (not internal quantized names)
+  const std::string expected_input_name = "input";
+  const std::string expected_output_name = "qdq_output_dq_out";
+
+  EXPECT_TRUE(tensor_names.count(expected_input_name))
+      << "Expected input '" << expected_input_name << "' not found.";
+  EXPECT_TRUE(tensor_names.count(expected_output_name))
+      << "Expected output '" << expected_output_name << "' not found.";
+}
+
+// TODO: Test will be re-enabled for Linux once QNN API issue is resolved
+#if !BUILD_QNN_EP_STATIC_LIB && !defined(__linux__)
+// Tests that loading and unloading of an EP library in the same process does not cause a segfault.
+TEST_F(QnnHTPBackendTests, LoadingAndUnloadingOfQnnLibrary_FixSegFault) {
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.quant.onnx";
+
+  ProviderOptions options;
+  options["backend_type"] = "htp";
+  options["offload_graph_io_quantization"] = "0";
+
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+  // By default, 8 is used, which will impact time to run all
+  // unit tests due to overhead of thread creation/destruction
+  options["num_graph_prepare_threads"] = "1";
+#endif
+
+  {
+    RegisteredEpDeviceUniquePtr registered_ep_device;
+    Ort::SessionOptions so;
+    RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, options);
+
+    EXPECT_NO_THROW(Ort::Session session(*ort_env, ort_model_path, so));
+  }
+
+  // The std::unique_ptr should be destroyed after leaving the scope.
+  {
+    RegisteredEpDeviceUniquePtr registered_ep_device;
+    Ort::SessionOptions so;
+    RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, options);
+
+    EXPECT_NO_THROW(Ort::Session session(*ort_env, ort_model_path, so));
+  }
+}
+#endif  // !BUILD_QNN_EP_STATIC_LIB && !defined(__linux__)
+
+#if defined(WIN32) && !BUILD_QNN_EP_STATIC_LIB
+// RAII guard that unconditionally unregisters an execution provider library on scope exit.
+// The AutoEp tests below register the EP library directly (without appending a device to the
+// session options, so RegisterQnnEpLibrary / RegisteredEpDeviceUniquePtr cannot be reused).
+// Without this guard, an early return from an ASSERT_* failure would leave the library
+// registered in the shared Ort::Env, corrupting subsequent tests (the source of the
+// intermittent failures).
+struct ScopedEpLibraryGuard {
+  const char* registration_name;
+  ~ScopedEpLibraryGuard() {
+    OrtStatus* status = Ort::GetApi().UnregisterExecutionProviderLibrary(*ort_env, registration_name);
+    if (status != nullptr) {
+      Ort::GetApi().ReleaseStatus(status);
+    }
+  }
+};
+
+// Tests autoEP feature to automatically select an EP that supports the NPU.
+// Currently only works on Windows.
+TEST_F(QnnHTPBackendTests, AutoEp_PreferNpu) {
+  ASSERT_ORTSTATUS_OK(Ort::GetApi().RegisterExecutionProviderLibrary(*ort_env, kQnnExecutionProvider,
+                                                                     ORT_TSTR("onnxruntime_providers_qnn.dll")));
+  ScopedEpLibraryGuard ep_guard{kQnnExecutionProvider};
+
+  Ort::SessionOptions so;
+  // Add this session option for GetEpGraphAssignmentInfo in SessionHasEp
+  so.AddConfigEntry(kOrtSessionOptionsRecordEpGraphAssignmentInfo, "1");
+  so.SetEpSelectionPolicy(OrtExecutionProviderDevicePolicy_PREFER_NPU);
+
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.quant.onnx";
+  {
+    Ort::Session session(*ort_env, ort_model_path, so);
+    EXPECT_TRUE(SessionHasEp(session, kQnnExecutionProvider));
+  }
+}
+
+TEST_F(QnnGPUBackendTests, AutoEp_PreferGpu) {
+  ASSERT_ORTSTATUS_OK(Ort::GetApi().RegisterExecutionProviderLibrary(*ort_env, kQnnExecutionProvider,
+                                                                     ORT_TSTR("onnxruntime_providers_qnn.dll")));
+  ScopedEpLibraryGuard ep_guard{kQnnExecutionProvider};
+
+  Ort::SessionOptions so;
+  // Add this session option for GetEpGraphAssignmentInfo in SessionHasEp
+  so.AddConfigEntry(kOrtSessionOptionsRecordEpGraphAssignmentInfo, "1");
+  so.SetEpSelectionPolicy(OrtExecutionProviderDevicePolicy_PREFER_GPU);
+
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.onnx";
+  {
+    Ort::Session session(*ort_env, ort_model_path, so);
+    EXPECT_TRUE(SessionHasEp(session, kQnnExecutionProvider));
+  }
+}
+
+TEST_F(QnnHTPBackendTests, AutoEp_AllDevices) {
+  ASSERT_ORTSTATUS_OK(Ort::GetApi().RegisterExecutionProviderLibrary(*ort_env, kQnnExecutionProvider,
+                                                                     ORT_TSTR("onnxruntime_providers_qnn.dll")));
+  ScopedEpLibraryGuard ep_guard{kQnnExecutionProvider};
+
+  Ort::SessionOptions so;
+  // Add this session option for GetEpGraphAssignmentInfo in SessionHasEp
+  so.AddConfigEntry(kOrtSessionOptionsRecordEpGraphAssignmentInfo, "1");
+  auto devices = ort_env->GetEpDevices();
+  std::vector<Ort::ConstEpDevice> selected_devices;
+
+  std::copy_if(devices.begin(),
+               devices.end(),
+               std::back_inserter(selected_devices),
+               [](Ort::ConstEpDevice& d) { return std::string_view(d.EpName()) == kQnnExecutionProvider; });
+
+  ASSERT_TRUE(selected_devices.size() > 0) << "No QNN devices were found.";
+
+  so.AppendExecutionProvider_V2(*ort_env, selected_devices, {});
+
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.quant.onnx";
+  {
+    Ort::Session session(*ort_env, ort_model_path, so);
+    EXPECT_TRUE(SessionHasEp(session, kQnnExecutionProvider));
+  }
+}
+
+TEST_F(QnnHTPBackendTests, AutoEp_NpuOnly) {
+  ASSERT_ORTSTATUS_OK(Ort::GetApi().RegisterExecutionProviderLibrary(*ort_env, kQnnExecutionProvider,
+                                                                     ORT_TSTR("onnxruntime_providers_qnn.dll")));
+  ScopedEpLibraryGuard ep_guard{kQnnExecutionProvider};
+
+  Ort::SessionOptions so;
+  // Add this session option for GetEpGraphAssignmentInfo in SessionHasEp
+  so.AddConfigEntry(kOrtSessionOptionsRecordEpGraphAssignmentInfo, "1");
+  auto devices = ort_env->GetEpDevices();
+  std::vector<Ort::ConstEpDevice> selected_devices;
+
+  std::copy_if(devices.begin(),
+               devices.end(),
+               std::back_inserter(selected_devices),
+               [](Ort::ConstEpDevice& d) {
+                 return std::string_view(d.EpName()) == kQnnExecutionProvider && d.Device().Type() == OrtHardwareDeviceType_NPU;
+               });
+
+  ASSERT_TRUE(selected_devices.size() > 0) << "No QNN NPU device was found.";
+
+  so.AppendExecutionProvider_V2(*ort_env, selected_devices, {});
+
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.quant.onnx";
+  {
+    Ort::Session session(*ort_env, ort_model_path, so);
+    EXPECT_TRUE(SessionHasEp(session, kQnnExecutionProvider));
+  }
+}
+
+TEST_F(QnnGPUBackendTests, AutoEp_GpuOnly) {
+  ASSERT_ORTSTATUS_OK(Ort::GetApi().RegisterExecutionProviderLibrary(*ort_env, kQnnExecutionProvider,
+                                                                     ORT_TSTR("onnxruntime_providers_qnn.dll")));
+  ScopedEpLibraryGuard ep_guard{kQnnExecutionProvider};
+
+  Ort::SessionOptions so;
+  // Add this session option for GetEpGraphAssignmentInfo in SessionHasEp
+  so.AddConfigEntry(kOrtSessionOptionsRecordEpGraphAssignmentInfo, "1");
+  auto devices = ort_env->GetEpDevices();
+  std::vector<Ort::ConstEpDevice> selected_devices;
+
+  std::copy_if(devices.begin(),
+               devices.end(),
+               std::back_inserter(selected_devices),
+               [](Ort::ConstEpDevice& d) {
+                 return std::string_view(d.EpName()) == kQnnExecutionProvider && d.Device().Type() == OrtHardwareDeviceType_GPU;
+               });
+
+  ASSERT_TRUE(selected_devices.size() > 0) << "No QNN GPU device was found.";
+
+  so.AppendExecutionProvider_V2(*ort_env, selected_devices, {});
+
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.onnx";
+  {
+    Ort::Session session(*ort_env, ort_model_path, so);
+    EXPECT_TRUE(SessionHasEp(session, kQnnExecutionProvider));
+  }
+}
+
+TEST_F(QnnGPUBackendTests, ElementwiseAbsoluteVerifier) {
+  ProviderOptions options;
+  options["backend_type"] = "gpu";
+
+  auto input_defs = {TestInputDef<float>({1, 3, 4, 4}, false, -10.0f, 10.0f),
+                     TestInputDef<float>({1, 3, 4, 4}, false, -10.0f, 10.0f)};
+
+  RunQnnModelTest(BuildOpTestCase<float>("Add_node", "Add", input_defs, {}, {}, kOnnxDomain),
+                  options,
+                  13,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(1e-5f)});
+}
+
+TEST_F(QnnGPUBackendTests, CosineSimilarityVerifier) {
+  ProviderOptions options;
+  options["backend_type"] = "gpu";
+
+  auto input_defs = {TestInputDef<float>({1, 3, 4, 4}, false, -10.0f, 10.0f),
+                     TestInputDef<float>({1, 3, 4, 4}, false, -10.0f, 10.0f)};
+
+  RunQnnModelTest(BuildOpTestCase<float>("Add_node", "Add", input_defs, {}, {}, kOnnxDomain),
+                  options,
+                  13,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, CosineSimilarityVerifier(0.99f)});
+}
+
+// Returns true if QNN EP was created and QNN HTP shared memory allocator is available, false otherwise.
+static bool CreateSessionWithQnnEpAndQnnHtpSharedMemoryAllocator(RegisteredEpDeviceUniquePtr& registered_ep_device, const ORTCHAR_T* model_path, Ort::Session& session) {
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
+  constexpr bool use_htp_backend = true;
+#else
+  constexpr bool use_htp_backend = false;
+#endif
+
+#if defined(_WIN32)
+  const char* backend_path = use_htp_backend ? "QnnHtp.dll" : "QnnCpu.dll";
+#else
+  const char* backend_path = use_htp_backend ? "libQnnHtp.so" : "libQnnCpu.so";
+#endif
+
+  ProviderOptions options;
+  options["backend_path"] = backend_path;
+  options["enable_htp_shared_memory_allocator"] = "1";
+
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+  // By default, 8 is used, which will impact time to run all
+  // unit tests due to overhead of thread creation/destruction
+  options["num_graph_prepare_threads"] = "1";
+#endif
+
+  Ort::SessionOptions session_options;
+  RegisterQnnEpLibrary(registered_ep_device, session_options, kQnnExecutionProvider, options);
+
+  try {
+    session = Ort::Session{*ort_env, model_path, session_options};
+    return true;
+  } catch (const Ort::Exception& e) {
+    // handle exception that indicates that the libcdsprpc.so / dll can't be loaded
+    std::string_view error_message = e.what();
+    std::string_view expected_error_message = "Failed to initialize RPCMEM dynamic library handle";
+
+    if (e.GetOrtErrorCode() == ORT_FAIL &&
+        error_message.find(expected_error_message) != std::string_view::npos) {
+      session = Ort::Session{nullptr};
+      return false;
+    }
+
+    // propagate other exceptions
+    throw;
+  }
+}
+
+TEST_F(QnnHTPBackendTests, get_allocator_qnn_htp_shared) {
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  {
+    Ort::Session session{nullptr};
+
+    const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "capi_symbolic_dims.onnx";
+    if (!CreateSessionWithQnnEpAndQnnHtpSharedMemoryAllocator(registered_ep_device, ort_model_path, session)) {
+      GTEST_SKIP() << "HTP shared memory allocator is unavailable.";
+    }
+
+    Ort::MemoryInfo info_qnn_htp_shared("QnnHtpShared", OrtAllocatorType::OrtDeviceAllocator, 0, OrtMemTypeCPU);
+    Ort::Allocator qnn_htp_shared_allocator(session, info_qnn_htp_shared);
+
+    auto allocator_info = qnn_htp_shared_allocator.GetInfo();
+    ASSERT_EQ(allocator_info, info_qnn_htp_shared);
+
+    void* p = qnn_htp_shared_allocator.Alloc(1024);
+    ASSERT_NE(p, nullptr);
+    qnn_htp_shared_allocator.Free(p);
+
+    auto mem_allocation = qnn_htp_shared_allocator.GetAllocation(1024);
+    ASSERT_NE(mem_allocation.get(), nullptr);
+    ASSERT_EQ(mem_allocation.size(), size_t{1024});
+  }
+}
+
+TEST_F(QnnHTPBackendTests, io_binding_qnn_htp_shared) {
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  {
+    Ort::Session session{nullptr};
+    const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "mul_1.onnx";
+    if (!CreateSessionWithQnnEpAndQnnHtpSharedMemoryAllocator(registered_ep_device, ort_model_path, session)) {
+      GTEST_SKIP() << "HTP shared memory allocator is unavailable.";
+    }
+
+    Ort::MemoryInfo info_qnn_htp_shared("QnnHtpShared", OrtAllocatorType::OrtDeviceAllocator, 0, OrtMemTypeCPU);
+
+    Ort::Allocator qnn_htp_shared_allocator(session, info_qnn_htp_shared);
+    auto allocator_info = qnn_htp_shared_allocator.GetInfo();
+    ASSERT_EQ(info_qnn_htp_shared, allocator_info);
+
+    const std::array<int64_t, 2> x_shape = {3, 2};
+    std::array<float, 3 * 2> x_values = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    auto input_data = qnn_htp_shared_allocator.GetAllocation(x_values.size() * sizeof(float));
+    ASSERT_NE(input_data.get(), nullptr);
+    memcpy(input_data.get(), x_values.data(), sizeof(float) * x_values.size());
+
+    // Create an OrtValue tensor backed by data on QNN HTP shared memory
+    Ort::Value bound_x = Ort::Value::CreateTensor(info_qnn_htp_shared, reinterpret_cast<float*>(input_data.get()), x_values.size(),
+                                                  x_shape.data(), x_shape.size());
+
+    // Setup expected output (y) from model. Note that QNN EP runs float32 operators as float16,
+    // so the output will not be exactly equal.
+    const std::array<int64_t, 2> expected_y_shape = {3, 2};
+    const std::array<float, 3 * 2> expected_y = {1.0f, 4.0f, 9.0f, 16.0f, 25.0f, 36.0f};
+    constexpr float y_max_abs_err = 1e-5f;
+    auto output_data = qnn_htp_shared_allocator.GetAllocation(expected_y.size() * sizeof(float));
+    ASSERT_NE(output_data.get(), nullptr);
+
+    // Create an OrtValue tensor backed by data on QNN HTP shared memory
+    Ort::Value bound_y = Ort::Value::CreateTensor(info_qnn_htp_shared, reinterpret_cast<float*>(output_data.get()),
+                                                  expected_y.size(), expected_y_shape.data(), expected_y_shape.size());
+
+    Ort::IoBinding binding(session);
+    binding.BindInput("X", bound_x);
+    binding.BindOutput("Y", bound_y);
+
+    session.Run(Ort::RunOptions(), binding);
+
+    // Check the values against the bound raw memory
+    {
+      gsl::span y{reinterpret_cast<const float*>(output_data.get()), expected_y.size()};
+      EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), y));
+    }
+
+    // Now compare values via GetOutputValues
+    {
+      std::vector<Ort::Value> output_values = binding.GetOutputValues();
+      ASSERT_EQ(output_values.size(), 1U);
+      const Ort::Value& Y_value = output_values[0];
+      ASSERT_TRUE(Y_value.IsTensor());
+      Ort::TensorTypeAndShapeInfo type_info = Y_value.GetTensorTypeAndShapeInfo();
+      ASSERT_EQ(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, type_info.GetElementType());
+      auto count = type_info.GetElementCount();
+      ASSERT_EQ(expected_y.size(), count);
+
+      gsl::span y{Y_value.GetTensorData<float>(), count};
+      EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), y));
+    }
+
+    {
+      std::vector<std::string> output_names = binding.GetOutputNames();
+      ASSERT_EQ(1U, output_names.size());
+      ASSERT_EQ(output_names[0].compare("Y"), 0);
+    }
+
+    // Now replace binding of Y with an on device binding instead of pre-allocated memory.
+    // This is when we can not allocate an OrtValue due to unknown dimensions
+    {
+      binding.BindOutput("Y", info_qnn_htp_shared);
+      session.Run(Ort::RunOptions(), binding);
+    }
+
+    // Check the output value allocated based on the device binding.
+    {
+      std::vector<Ort::Value> output_values = binding.GetOutputValues();
+      ASSERT_EQ(output_values.size(), 1U);
+      const Ort::Value& Y_value = output_values[0];
+      ASSERT_TRUE(Y_value.IsTensor());
+      Ort::TensorTypeAndShapeInfo type_info = Y_value.GetTensorTypeAndShapeInfo();
+      ASSERT_EQ(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, type_info.GetElementType());
+      auto count = type_info.GetElementCount();
+      ASSERT_EQ(expected_y.size(), count);
+
+      gsl::span y{Y_value.GetTensorData<float>(), count};
+      EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), y));
+    }
+
+    // Clean up
+    binding.ClearBoundInputs();
+    binding.ClearBoundOutputs();
+  }
+}
+
+TEST_F(QnnHTPBackendTests, io_binding_qnn_htp_shared_offset) {
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  {
+    Ort::Session session{nullptr};
+    const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "mul_1.onnx";
+    if (!CreateSessionWithQnnEpAndQnnHtpSharedMemoryAllocator(registered_ep_device, ort_model_path, session)) {
+      GTEST_SKIP() << "HTP shared memory allocator is unavailable.";
+    }
+
+    Ort::MemoryInfo info_qnn_htp_shared("QnnHtpShared", OrtAllocatorType::OrtDeviceAllocator, 0, OrtMemTypeCPU);
+
+    Ort::Allocator qnn_htp_shared_allocator(session, info_qnn_htp_shared);
+    auto allocator_info = qnn_htp_shared_allocator.GetInfo();
+    ASSERT_EQ(info_qnn_htp_shared, allocator_info);
+
+    const std::array<int64_t, 2> x_shape = {3, 2};
+    std::array<float, 3 * 2> x_values = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+
+    const size_t x_allocation_offset_bytes = 4 * sizeof(float);
+    const size_t x_allocation_size_bytes = x_allocation_offset_bytes + x_values.size() * sizeof(float);
+
+    auto input_data_base = qnn_htp_shared_allocator.GetAllocation(x_allocation_size_bytes);
+    ASSERT_NE(input_data_base.get(), nullptr);
+
+    auto input_data = reinterpret_cast<float*>(static_cast<uint8_t*>(input_data_base.get()) + x_allocation_offset_bytes);
+    memcpy(input_data, x_values.data(), sizeof(float) * x_values.size());
+
+    // Create an OrtValue tensor backed by data on QNN HTP shared memory
+    Ort::Value bound_x = Ort::Value::CreateTensor(info_qnn_htp_shared, input_data, x_values.size(),
+                                                  x_shape.data(), x_shape.size());
+
+    // Setup expected output (y) from model. Note that QNN EP runs float32 operators as float16,
+    // so the output will not be exactly equal.
+    const std::array<int64_t, 2> expected_y_shape = {3, 2};
+    const std::array<float, 3 * 2> expected_y = {1.0f, 4.0f, 9.0f, 16.0f, 25.0f, 36.0f};
+    constexpr float y_max_abs_err = 1e-5f;
+
+    const size_t y_allocation_offset_bytes = 4 * sizeof(float);
+    const size_t y_allocation_size_bytes = y_allocation_offset_bytes + expected_y.size() * sizeof(float);
+
+    auto output_data_base = qnn_htp_shared_allocator.GetAllocation(y_allocation_size_bytes);
+    ASSERT_NE(output_data_base.get(), nullptr);
+
+    auto output_data = reinterpret_cast<float*>(static_cast<uint8_t*>(output_data_base.get()) + y_allocation_offset_bytes);
+
+    // Create an OrtValue tensor backed by data on QNN HTP shared memory
+    Ort::Value bound_y = Ort::Value::CreateTensor(info_qnn_htp_shared, output_data,
+                                                  expected_y.size(), expected_y_shape.data(), expected_y_shape.size());
+
+    Ort::IoBinding binding(session);
+    binding.BindInput("X", bound_x);
+    binding.BindOutput("Y", bound_y);
+
+    session.Run(Ort::RunOptions(), binding);
+
+    // Check the values against the bound raw memory
+    {
+      gsl::span y{output_data, expected_y.size()};
+      EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), y));
+    }
+
+    // Now compare values via GetOutputValues
+    {
+      std::vector<Ort::Value> output_values = binding.GetOutputValues();
+      ASSERT_EQ(output_values.size(), 1U);
+      const Ort::Value& Y_value = output_values[0];
+      ASSERT_TRUE(Y_value.IsTensor());
+      Ort::TensorTypeAndShapeInfo type_info = Y_value.GetTensorTypeAndShapeInfo();
+      ASSERT_EQ(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, type_info.GetElementType());
+      auto count = type_info.GetElementCount();
+      ASSERT_EQ(expected_y.size(), count);
+
+      gsl::span y{Y_value.GetTensorData<float>(), count};
+      EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), y));
+    }
+
+    {
+      std::vector<std::string> output_names = binding.GetOutputNames();
+      ASSERT_EQ(1U, output_names.size());
+      ASSERT_EQ(output_names[0].compare("Y"), 0);
+    }
+
+    // Now replace binding of Y with an on device binding instead of pre-allocated memory.
+    // This is when we can not allocate an OrtValue due to unknown dimensions
+    {
+      binding.BindOutput("Y", info_qnn_htp_shared);
+      session.Run(Ort::RunOptions(), binding);
+    }
+
+    // Check the output value allocated based on the device binding.
+    {
+      std::vector<Ort::Value> output_values = binding.GetOutputValues();
+      ASSERT_EQ(output_values.size(), 1U);
+      const Ort::Value& Y_value = output_values[0];
+      ASSERT_TRUE(Y_value.IsTensor());
+      Ort::TensorTypeAndShapeInfo type_info = Y_value.GetTensorTypeAndShapeInfo();
+      ASSERT_EQ(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, type_info.GetElementType());
+      auto count = type_info.GetElementCount();
+      ASSERT_EQ(expected_y.size(), count);
+
+      gsl::span y{Y_value.GetTensorData<float>(), count};
+      EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), y));
+    }
+
+    // Clean up
+    binding.ClearBoundInputs();
+    binding.ClearBoundOutputs();
+  }
+}
+#endif  // defined(WIN32) && !BUILD_QNN_EP_STATIC_LIB
+
+// Test whether QNN EP can handle the case where the number of graph inputs and
+// the number of tensor wrappers do not match.
+// Take Resize op as an example.
+// - Qnn only cares about the 1st input, so the rest of the inputs are not converted
+//   to tensor wrappers.
+// - However, these remaining inputs still appear in the graph inputs,
+//   resulting in a discrepancy in the input quantities.
+TEST_F(QnnHTPBackendTests, TestMismatchedGraphInputAndTensorWrapperCount) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+
+  auto input_defs = {TestInputDef<float>({1, 3, 10, 10}, false, -10.0f, 10.0f),
+                     TestInputDef<float>({0}, false, {}),
+                     TestInputDef<float>({4}, true, {1.0f, 1.0f, 2.0f, 2.0f})};
+  auto attrs = {test::MakeAttribute("mode", "nearest"),
+                test::MakeAttribute("coordinate_transformation_mode", "asymmetric"),
+                test::MakeAttribute("nearest_mode", "floor")};
+  RunQnnModelTest(BuildOpTestCase<float>("Resize_node",
+                                         "Resize",
+                                         input_defs,
+                                         {},
+                                         attrs,
+                                         kOnnxDomain),
+                  provider_options,
+                  11,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(0.008f)});
+}
+
+// Compile a QDQ model to a context binary with offload_graph_io_quantization=1,
+// then load and run the context binary. Regression test for PR #234.
+TEST_F(QnnHTPBackendTests, OffloadGraphIoQuantizationContextBinaryRoundTrip) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  const std::string ctx_model_file = "./offload_qdq_ctx_test.onnx";
+  std::remove(ctx_model_file.c_str());
+  auto cleanup = gsl::finally([&]() { std::remove(ctx_model_file.c_str()); });
+
+  std::vector<float> input_data = GetFloatDataInRange(0.0f, 1.0f, 8);
+  TestInputDef<float> input_def({1, 2, 2, 2}, false, input_data);
+
+  std::unique_ptr<ModelAndBuilder> model;
+  CreateModelInMemory(model, QDQBuildSigmoidForTensorNameTest<uint8_t>(input_def), 21);
+
+  ProviderOptions provider_options;
+#if defined(_WIN32)
+  provider_options["backend_path"] = "QnnHtp.dll";
+#else
+  provider_options["backend_path"] = "libQnnHtp.so";
+#endif
+  provider_options["offload_graph_io_quantization"] = "1";
+
+  {
+    Ort::SessionOptions so;
+    so.SetGraphOptimizationLevel(ORT_ENABLE_ALL);
+    so.AddConfigEntry(kOrtSessionOptionEpContextEnable, "1");
+    so.AddConfigEntry(kOrtSessionOptionEpContextFilePath, ctx_model_file.c_str());
+
+    RegisteredEpDeviceUniquePtr registered_ep_device;
+    RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, provider_options);
+
+    ScopedOrtSession scoped(std::move(registered_ep_device), Ort::Session(*ort_env, model->model_data.data(), model->model_data.size(), so));
+    ASSERT_TRUE(std::filesystem::exists(ctx_model_file)) << "Context binary not generated";
+  }
+
+  Ort::SessionOptions so2;
+  so2.AddConfigEntry(kOrtSessionOptionEpContextFilePath, ctx_model_file.c_str());
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, so2, kQnnExecutionProvider, provider_options);
+
+  std::ifstream ifs(ctx_model_file, std::ios::binary);
+  std::string ctx_data((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+  ScopedOrtSession scoped(std::move(registered_ep_device), Ort::Session(*ort_env, ctx_data.data(), ctx_data.size(), so2));
+}
+
+#endif  // defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
+
+// Test that QNN Ir generates the expected DLC file for a model meant to run on the QNN CPU backend,
+// using the CPU backend's validator.
+TEST_F(QnnCPUBackendTests, QnnIr_CpuValidator_OutputFiles) {
+  BackendSupport ir_backend_support = IsIRBackendSupported();
+  if (ir_backend_support == BackendSupport::UNSUPPORTED) {
+    GTEST_SKIP() << "QNN IR backend is not available! Skipping test.";
+  }
+  ASSERT_NE(ir_backend_support, BackendSupport::SUPPORT_ERROR) << "Failed to check if QNN IR backend is available.";
+
+  const std::filesystem::path qnn_dlc_dir = kDlcOutputDir;
+
+  // Remove pre-existing QNN Ir output files. Note that fs::remove_all() can handle non-existing paths.
+  std::filesystem::remove_all(qnn_dlc_dir);
+  ASSERT_FALSE(std::filesystem::exists(qnn_dlc_dir));
+
+  auto scoped = InitNHWCResizeModel(ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.onnx",
+                                    TestBackend::Cpu,  // backend (also used as the validator)
+                                    TestBackend::Ir);  // serializer backend
+
+  ASSERT_TRUE(std::filesystem::exists(qnn_dlc_dir));
+
+  int file_count = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(qnn_dlc_dir)) {
+    EXPECT_TRUE(entry.is_regular_file());
+    EXPECT_EQ(entry.path().extension(), ".dlc");
+    ++file_count;
+  }
+  EXPECT_EQ(file_count, 1);
+}
+
+// Test that QNN Ir generates the expected DLC file using the QnnIr backend itself as the validator.
+// Only requires host-side compilation capability (backendCreate + backendValidateOpConfig) and does
+// NOT require inference hardware, so it can run on Windows x64 development hosts.
+TEST_F(QnnIRBackendTests, QnnIr_IrValidator_OutputFiles) {
+  const std::filesystem::path qnn_dlc_dir = kDlcOutputDir;
+
+  // Remove pre-existing QNN Ir output files. Note that fs::remove_all() can handle non-existing paths.
+  std::filesystem::remove_all(qnn_dlc_dir);
+  ASSERT_FALSE(std::filesystem::exists(qnn_dlc_dir));
+
+  auto scoped = InitNHWCResizeModel(ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.onnx",
+                                    TestBackend::Ir,   // backend (also used as the validator)
+                                    TestBackend::Ir);  // serializer backend
+
+  // File names are taken from graph node names. Just make sure that we got one .dlc
+  // in the expected directory.
+  ASSERT_TRUE(std::filesystem::exists(qnn_dlc_dir));
+
+  int file_count = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(qnn_dlc_dir)) {
+    EXPECT_TRUE(entry.is_regular_file());
+    EXPECT_EQ(entry.path().extension(), ".dlc");
+    ++file_count;
+  }
+  EXPECT_EQ(file_count, 1);
+}
+
+// Test that QNN Saver generates the expected files for a model meant to run on any QNN backend.
+TEST(QnnSaverBackendTests, DISABLED_QnnSaver_OutputFiles) {
+  const std::filesystem::path qnn_saver_output_dir = "saver_output";
+
+  // Remove pre-existing QNN Saver output files. Note that fs::remove_all() can handle non-existing paths.
+  std::filesystem::remove_all(qnn_saver_output_dir);
+  ASSERT_FALSE(std::filesystem::exists(qnn_saver_output_dir));
+
+  auto scoped = InitNHWCResizeModel(ORT_MODEL_FOLDER "nhwc_resize_sizes_opset18.onnx",
+                                    TestBackend::Saver,   // backend
+                                    TestBackend::Saver);  // serializer_backend
+
+  // Check that QNN Saver output files exist.
+  EXPECT_TRUE(std::filesystem::exists(qnn_saver_output_dir / "saver_output.c"));
+  EXPECT_TRUE(std::filesystem::exists(qnn_saver_output_dir / "params.bin"));
+}
+
+// Returns a function that builds a model with EyeLike (CPU-only) + Add
+// to test partition-added inputs.
+static GetTestModelFn BuildPartitionAddedInputModel() {
+  return [](ModelTestBuilder& builder) {
+    builder.graph_->set_name("partition_added_input_graph");
+
+    // Create input
+    MakeTestInput<float>(builder, "input", TestInputDef<float>({1, 3}, false, {1.0f, 2.0f, 3.0f}));
+
+    // "constant" is a graph input (not an initializer) to prevent ORT constant-folding EyeLike.
+    MakeTestInput<float>(builder, "constant", TestInputDef<float>({1, 3}, false, {0.0f, 0.0f, 0.0f}));
+
+    // EyeLike: CPU-only op (no QNN builder) that creates a partition-added input
+    builder.AddNode("el", "EyeLike", {"constant"}, {"el_output"}, kOnnxDomain);
+
+    // Add: combines graph input with partition-added input
+    builder.AddNode("add", "Add", {"input", "el_output"}, {"add_output"}, kOnnxDomain);
+
+    builder.MakeOutput("add_output");
+  };
+}
+
+// Verifies that a partition-added input (produced by a CPU-only op) is registered as
+// QNN_TENSOR_TYPE_APP_WRITE, not dropped from the fused subgraph's input list.
+TEST_F(QnnCPUBackendTests, PartitionAddedInputRegisteredAsGraphInput) {
+  // Build model using public API
+  std::unique_ptr<ModelAndBuilder> model;
+  CreateModelInMemory(model, BuildPartitionAddedInputModel(), 13);
+
+  Ort::SessionOptions so;
+  so.SetGraphOptimizationLevel(ORT_ENABLE_ALL);
+
+  ProviderOptions options;
+#if defined(_WIN32)
+  options["backend_path"] = "QnnCpu.dll";
+#else
+  options["backend_path"] = "libQnnCpu.so";
+#endif
+
+  const std::filesystem::path tmp_dir = "qnn_partition_input_test";
+  std::filesystem::remove_all(tmp_dir);
+  std::filesystem::create_directory(tmp_dir);
+  auto cleanup = gsl::finally([&tmp_dir]() { std::filesystem::remove_all(tmp_dir); });
+
+  options["json_qnn_graph_dir"] = tmp_dir.string();
+  options["dump_json_qnn_graph"] = "1";
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, options);
+
+  ScopedOrtSession scoped(std::move(registered_ep_device),
+                          Ort::Session(*ort_env, model->model_data.data(), model->model_data.size(), so));
+
+  std::filesystem::path json_path;
+  for (const auto& entry : std::filesystem::directory_iterator{tmp_dir}) {
+    if (entry.is_regular_file() && entry.path().extension() == ".json" &&
+        entry.path().filename().string().find("_tensor_log") == std::string::npos) {
+      json_path = entry.path();
+      break;
+    }
+  }
+  ASSERT_FALSE(json_path.empty()) << "No JSON file found in " << tmp_dir;
+
+  std::vector<std::pair<std::string, int>> inputs_with_id;
+  {
+    std::ifstream json_file(json_path);
+    ASSERT_TRUE(json_file.is_open());
+    nlohmann::json root;
+    json_file >> root;
+    for (const auto& [name, tensor] : root["graph"]["tensors"].items()) {
+      if (tensor.value("type", -1) == 0) {  // QNN_TENSOR_TYPE_APP_WRITE
+        inputs_with_id.emplace_back(name, tensor.value("id", -1));
+      }
+    }
+  }
+  std::sort(inputs_with_id.begin(), inputs_with_id.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; });
+
+  // ONNX-declared input first, partition-added input second.
+  ASSERT_EQ(inputs_with_id.size(), 2u);
+  EXPECT_EQ(inputs_with_id[0].first, "input");
+  EXPECT_EQ(inputs_with_id[1].first, "el_output");
+}
+
+// Returns a function that builds a QDQ model with EyeLike (CPU-only) + Add
+// to test partition-added inputs with offload_graph_io_quantization.
+static GetTestModelFn BuildPartitionAddedInputQDQModel() {
+  return [](ModelTestBuilder& builder) {
+    builder.graph_->set_name("partition_added_input_qdq_graph");
+
+    // Create input
+    MakeTestInput<float>(builder, "input", TestInputDef<float>({1, 3}, false, {1.0f, 2.0f, 3.0f}));
+
+    // "constant" is a graph input (not an initializer) to prevent ORT constant-folding EyeLike.
+    MakeTestInput<float>(builder, "constant", TestInputDef<float>({1, 3}, false, {0.0f, 0.0f, 0.0f}));
+    builder.MakeInitializer<float>("scale", {}, {1.0f / 255.0f});
+    builder.MakeInitializer<uint8_t>("zero_point", {}, {0});
+
+    // QuantizeLinear: input -> q_input (stays on CPU with offload_graph_io_quantization=1)
+    builder.AddNode("quantize", "QuantizeLinear", {"input", "scale", "zero_point"}, {"q_input"}, kOnnxDomain);
+
+    // DequantizeLinear: q_input -> dq_input (goes to QNN)
+    builder.AddNode("dequantize", "DequantizeLinear", {"q_input", "scale", "zero_point"}, {"dq_input"}, kOnnxDomain);
+
+    // EyeLike: CPU-only op (no QNN builder) that creates a partition-added input
+    builder.AddNode("el", "EyeLike", {"constant"}, {"el_output"}, kOnnxDomain);
+
+    // Add: combines dequantized input with partition-added input
+    builder.AddNode("add", "Add", {"dq_input", "el_output"}, {"add_output"}, kOnnxDomain);
+
+    builder.MakeOutput("add_output");
+  };
+}
+
+// Verifies the same as PartitionAddedInputRegisteredAsGraphInput but via the
+// tensor_name_overrides code path: with offload_graph_io_quantization=1,
+// QuantizeLinear stays on CPU and causes a tensor name remap (q_input <-> input).
+TEST_F(QnnCPUBackendTests, PartitionAddedInputRegisteredAsGraphInputOffloadGraphIoQuantization) {
+  // Build model using public API
+  std::unique_ptr<ModelAndBuilder> model;
+  CreateModelInMemory(model, BuildPartitionAddedInputQDQModel(), 13);
+
+  Ort::SessionOptions so;
+  so.SetGraphOptimizationLevel(ORT_ENABLE_ALL);
+
+  ProviderOptions options;
+#if defined(_WIN32)
+  options["backend_path"] = "QnnCpu.dll";
+#else
+  options["backend_path"] = "libQnnCpu.so";
+#endif
+  options["offload_graph_io_quantization"] = "1";
+
+  const std::filesystem::path tmp_dir = "qnn_partition_input_offload_test";
+  std::filesystem::remove_all(tmp_dir);
+  std::filesystem::create_directory(tmp_dir);
+  auto cleanup = gsl::finally([&tmp_dir]() { std::filesystem::remove_all(tmp_dir); });
+
+  options["json_qnn_graph_dir"] = tmp_dir.string();
+  options["dump_json_qnn_graph"] = "1";
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, options);
+
+  ScopedOrtSession scoped(std::move(registered_ep_device),
+                          Ort::Session(*ort_env, model->model_data.data(), model->model_data.size(), so));
+
+  std::filesystem::path json_path;
+  for (const auto& entry : std::filesystem::directory_iterator{tmp_dir}) {
+    if (entry.is_regular_file() && entry.path().extension() == ".json" &&
+        entry.path().filename().string().find("_tensor_log") == std::string::npos) {
+      json_path = entry.path();
+      break;
+    }
+  }
+  ASSERT_FALSE(json_path.empty()) << "No JSON file found in " << tmp_dir;
+
+  std::vector<std::pair<std::string, int>> inputs_with_id;
+  {
+    std::ifstream json_file(json_path);
+    ASSERT_TRUE(json_file.is_open());
+    nlohmann::json root;
+    json_file >> root;
+    for (const auto& [name, tensor] : root["graph"]["tensors"].items()) {
+      if (tensor.value("type", -1) == 0) {  // QNN_TENSOR_TYPE_APP_WRITE
+        inputs_with_id.emplace_back(name, tensor.value("id", -1));
+      }
+    }
+  }
+  std::sort(inputs_with_id.begin(), inputs_with_id.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; });
+
+  // ONNX-declared input first (registered under its external name "input" via tensor_name_overrides),
+  // partition-added input second.
+  ASSERT_EQ(inputs_with_id.size(), 2u);
+  EXPECT_EQ(inputs_with_id[0].first, "input");
+  EXPECT_EQ(inputs_with_id[1].first, "el_output");
+}
+
+// Returns a model where a single graph input fans out to two separate Q->DQ chains,
+// both feeding into an Add node. This triggers the duplicate-name scenario in
+// RegisterGraphInputOutputInOrder when offload_graph_io_quantization=1.
+static GetTestModelFn BuildGraphInputFanoutQDQModel() {
+  return [](ModelTestBuilder& builder) {
+    builder.graph_->set_name("graph_input_fanout_qdq_graph");
+
+    MakeTestInput<float>(builder, "input", TestInputDef<float>({1, 3}, false, {0.1f, 0.2f, 0.3f}));
+    builder.MakeInitializer<float>("scale", {}, {1.0f / 255.0f});
+    builder.MakeInitializer<uint8_t>("zero_point", {}, {0});
+
+    // Two Q->DQ pairs on the same graph input. With offload_graph_io_quantization=1,
+    // both Q nodes stay on CPU and both DQ outputs are registered as QNN graph inputs
+    // with the override name "input" — triggering the duplicate-name id-assignment bug.
+    builder.AddNode("q_a", "QuantizeLinear", {"input", "scale", "zero_point"}, {"q_a_out"}, kOnnxDomain);
+    builder.AddNode("dq_a", "DequantizeLinear", {"q_a_out", "scale", "zero_point"}, {"dq_a_out"}, kOnnxDomain);
+
+    builder.AddNode("q_b", "QuantizeLinear", {"input", "scale", "zero_point"}, {"q_b_out"}, kOnnxDomain);
+    builder.AddNode("dq_b", "DequantizeLinear", {"q_b_out", "scale", "zero_point"}, {"dq_b_out"}, kOnnxDomain);
+
+    builder.AddNode("add", "Add", {"dq_a_out", "dq_b_out"}, {"add_out"}, kOnnxDomain);
+
+    // Q->DQ pair on the graph output. With offload_graph_io_quantization=1,
+    // this DQ node stays on CPU and add_out is registered as a QNN graph output.
+    builder.AddNode("q_out", "QuantizeLinear", {"add_out", "scale", "zero_point"}, {"q_out_out"}, kOnnxDomain);
+    builder.AddNode("dq_out", "DequantizeLinear", {"q_out_out", "scale", "zero_point"}, {"output"}, kOnnxDomain);
+    builder.MakeOutput("output");
+  };
+}
+
+// Tests that a graph input fanning out to multiple QDQ pairs with offload_graph_io_quantization=1
+// composes without error. Two bugs were fixed:
+//   1. CreateTensorInQnnGraph returned early on a duplicate override name, leaving the second
+//      DQ tensor with QNN tensor id=0 (never set).
+//   2. GetGraphInputOutputTensorWrapper must deduplicate wrappers sharing the same override name
+//      to avoid passing more inputs to graphExecute than the QNN graph has APP_WRITE tensors.
+TEST_F(QnnCPUBackendTests, OffloadGraphIoQuantizationMultipleQDQPairsOnGraphInput) {
+  std::unique_ptr<ModelAndBuilder> model;
+  CreateModelInMemory(model, BuildGraphInputFanoutQDQModel(), 18);
+
+  Ort::SessionOptions so;
+  so.SetGraphOptimizationLevel(ORT_DISABLE_ALL);
+
+  ProviderOptions options;
+#if defined(_WIN32)
+  options["backend_path"] = "QnnCpu.dll";
+#else
+  options["backend_path"] = "libQnnCpu.so";
+#endif
+  options["offload_graph_io_quantization"] = "1";
+
+#if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
+  options["num_graph_prepare_threads"] = "1";
+#endif
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, options);
+
+  ScopedOrtSession scoped(std::move(registered_ep_device), Ort::Session(*ort_env, model->model_data.data(), model->model_data.size(), so));
+  auto& session = scoped.session();
+
+  // Run inference: verify output ≈ 2 * input (two identical DQ branches added together).
+  std::vector<float> input_data = {0.1f, 0.2f, 0.3f};
+  std::array<int64_t, 2> input_shape = {1, 3};
+  auto memory_info = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);
+  std::vector<Ort::Value> ort_inputs;
+  ort_inputs.emplace_back(Ort::Value::CreateTensor<float>(
+      memory_info, input_data.data(), input_data.size(), input_shape.data(), input_shape.size()));
+
+  const char* input_name = "input";
+  const char* output_name = "output";
+  std::vector<Ort::Value> ort_outputs = session.Run(
+      Ort::RunOptions{nullptr}, &input_name, ort_inputs.data(), 1, &output_name, 1);
+
+  ASSERT_EQ(ort_outputs.size(), 1u);
+  const float* output_data = ort_outputs[0].GetTensorData<float>();
+  EXPECT_NEAR(output_data[0], 2.0f * input_data[0], 0.02f);
+  EXPECT_NEAR(output_data[1], 2.0f * input_data[1], 0.02f);
+  EXPECT_NEAR(output_data[2], 2.0f * input_data[2], 0.02f);
+}
+
+// Returns a function that builds a model with 3 Relu ops to test I/O ordering.
+static GetTestModelFn BuildMultiReluModelForIOOrderTest() {
+  return [](ModelTestBuilder& builder) {
+    builder.graph_->set_name("multi_relu_io_order_graph");
+
+    // Create inputs in specific order: {i2, i1, i3}
+    MakeTestInput<float>(builder, "i2", TestInputDef<float>({1, 5}, false, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f}));
+    MakeTestInput<float>(builder, "i1", TestInputDef<float>({1, 3}, false, {1.0f, 2.0f, 3.0f}));
+    MakeTestInput<float>(builder, "i3", TestInputDef<float>({1, 7}, false, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f}));
+
+    // Add Relu nodes
+    builder.AddNode("Relu1", "Relu", {"i1"}, {"o1"}, kOnnxDomain);
+    builder.AddNode("Relu2", "Relu", {"i3"}, {"o3"}, kOnnxDomain);
+    builder.AddNode("Relu3", "Relu", {"i2"}, {"o2"}, kOnnxDomain);
+
+    // Create outputs in specific order: {o2, o1, o3}
+    builder.MakeOutput("o2");
+    builder.MakeOutput("o1");
+    builder.MakeOutput("o3");
+  };
+}
+
+// Verifies QNN graph I/O order matches ONNX declaration order.
+TEST_F(QnnCPUBackendTests, GraphInputOutputOrderMatchesOnnx) {
+  ProviderOptions provider_options;
+#if defined(_WIN32)
+  provider_options["backend_path"] = "QnnCpu.dll";
+#else
+  provider_options["backend_path"] = "libQnnCpu.so";
+#endif
+
+  const std::filesystem::path tmp_dir = "qnn_io_order_test";
+  provider_options["json_qnn_graph_dir"] = tmp_dir.string();
+  provider_options["dump_json_qnn_graph"] = "1";
+
+  // Remove pre-existing json files
+  std::filesystem::remove_all(tmp_dir);
+  ASSERT_TRUE(std::filesystem::create_directory(tmp_dir));
+
+  auto cleanup = gsl::finally([&tmp_dir]() { std::filesystem::remove_all(tmp_dir); });
+
+  // Build model using helper function
+  std::unique_ptr<ModelAndBuilder> model;
+  CreateModelInMemory(model, BuildMultiReluModelForIOOrderTest(), 13);
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  Ort::SessionOptions so;
+  so.SetGraphOptimizationLevel(ORT_ENABLE_ALL);
+  RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, provider_options);
+
+  ScopedOrtSession scoped(std::move(registered_ep_device),
+                          Ort::Session(*ort_env, model->model_data.data(), model->model_data.size(), so));
+
+  // Find the JSON graph file
+  std::filesystem::path json_path;
+  for (const auto& entry : std::filesystem::directory_iterator{tmp_dir}) {
+    if (entry.is_regular_file() && entry.path().extension() == ".json" &&
+        entry.path().filename().string().find("_tensor_log") == std::string::npos) {
+      json_path = entry.path();
+      break;
+    }
+  }
+  ASSERT_FALSE(json_path.empty()) << "No JSON file found in " << tmp_dir;
+
+  // Parse JSON and extract tensor names with IDs
+  std::vector<std::pair<std::string, int>> inputs_with_id, outputs_with_id;
+  {
+    std::ifstream json_file(json_path);
+    ASSERT_TRUE(json_file.is_open());
+
+    nlohmann::json root;
+    json_file >> root;
+
+    for (const auto& [name, tensor] : root["graph"]["tensors"].items()) {
+      int type = tensor.value("type", -1);
+      int id = tensor.value("id", -1);
+      if (type == 0) {
+        inputs_with_id.emplace_back(name, id);  // QNN_TENSOR_TYPE_APP_WRITE
+      } else if (type == 1) {
+        outputs_with_id.emplace_back(name, id);  // QNN_TENSOR_TYPE_APP_READ
+      }
+    }
+  }
+
+  // Sort by tensor ID to recover registration order
+  std::sort(inputs_with_id.begin(), inputs_with_id.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; });
+  std::sort(outputs_with_id.begin(), outputs_with_id.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; });
+
+  std::vector<std::string> input_names, output_names;
+  for (const auto& [name, id] : inputs_with_id) {
+    input_names.push_back(name);
+  }
+  for (const auto& [name, id] : outputs_with_id) {
+    output_names.push_back(name);
+  }
+
+  // Verify correct count
+  ASSERT_EQ(input_names.size(), 3u) << "Expected 3 inputs";
+  ASSERT_EQ(output_names.size(), 3u) << "Expected 3 outputs";
+
+  // Verify ordering matches ONNX declaration: {i2, i1, i3} and {o2, o1, o3}
+  EXPECT_EQ(input_names[0], "i2");
+  EXPECT_EQ(input_names[1], "i1");
+  EXPECT_EQ(input_names[2], "i3");
+
+  EXPECT_EQ(output_names[0], "o2");
+  EXPECT_EQ(output_names[1], "o1");
+  EXPECT_EQ(output_names[2], "o3");
+}
+
+// Returns a function that builds a QDQ model with 3 Sigmoid ops to test I/O ordering with offload_graph_io_quantization.
+template <typename QuantType>
+static GetTestModelFn BuildMultiSigmoidQDQModelForIOOrderTest() {
+  return [](ModelTestBuilder& builder) {
+    builder.graph_->set_name("multi_sigmoid_qdq_io_order_graph");
+
+    float scale = 1.0f / 255.0f;
+    QuantType zero_point = 128;
+
+    // Create inputs in specific order: {i2, i1, i3}
+    MakeTestInput<float>(builder, "i2", TestInputDef<float>({1, 5}, false, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f}));
+    MakeTestInput<float>(builder, "i1", TestInputDef<float>({1, 3}, false, {1.0f, 2.0f, 3.0f}));
+    MakeTestInput<float>(builder, "i3", TestInputDef<float>({1, 7}, false, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f}));
+
+    // Build QDQ Sigmoid chains for each input
+    auto qdq2_out = AddQDQNodePair<QuantType>(builder, "qdq2", "i2", scale, zero_point);
+    builder.AddNode("Sigmoid3", "Sigmoid", {qdq2_out}, {"sigmoid2_out"}, kOnnxDomain);
+    AddQDQNodePairWithOutputAsGraphOutput<QuantType>(builder, "qdq2_out", "sigmoid2_out", scale, zero_point);
+
+    auto qdq1_out = AddQDQNodePair<QuantType>(builder, "qdq1", "i1", scale, zero_point);
+    builder.AddNode("Sigmoid1", "Sigmoid", {qdq1_out}, {"sigmoid1_out"}, kOnnxDomain);
+    AddQDQNodePairWithOutputAsGraphOutput<QuantType>(builder, "qdq1_out", "sigmoid1_out", scale, zero_point);
+
+    auto qdq3_out = AddQDQNodePair<QuantType>(builder, "qdq3", "i3", scale, zero_point);
+    builder.AddNode("Sigmoid2", "Sigmoid", {qdq3_out}, {"sigmoid3_out"}, kOnnxDomain);
+    AddQDQNodePairWithOutputAsGraphOutput<QuantType>(builder, "qdq3_out", "sigmoid3_out", scale, zero_point);
+  };
+}
+
+// Verifies QNN graph I/O order matches ONNX declaration order with offload_graph_io_quantization=1.
+TEST_F(QnnCPUBackendTests, GraphInputOutputOrderMatchesOnnxOffloadGraphIoQuantization) {
+  ProviderOptions provider_options;
+#if defined(_WIN32)
+  provider_options["backend_path"] = "QnnCpu.dll";
+#else
+  provider_options["backend_path"] = "libQnnCpu.so";
+#endif
+  provider_options["offload_graph_io_quantization"] = "1";
+
+  const std::filesystem::path tmp_dir = "qnn_io_order_qdq_test";
+  provider_options["json_qnn_graph_dir"] = tmp_dir.string();
+  provider_options["dump_json_qnn_graph"] = "1";
+
+  // Remove pre-existing json files
+  std::filesystem::remove_all(tmp_dir);
+  ASSERT_TRUE(std::filesystem::create_directory(tmp_dir));
+
+  auto cleanup = gsl::finally([&tmp_dir]() { std::filesystem::remove_all(tmp_dir); });
+
+  // Build QDQ model using helper function
+  std::unique_ptr<ModelAndBuilder> model;
+  CreateModelInMemory(model, BuildMultiSigmoidQDQModelForIOOrderTest<uint8_t>(), 21);
+
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  Ort::SessionOptions so;
+  so.SetGraphOptimizationLevel(ORT_ENABLE_ALL);
+  RegisterQnnEpLibrary(registered_ep_device, so, kQnnExecutionProvider, provider_options);
+
+  ScopedOrtSession scoped(std::move(registered_ep_device),
+                          Ort::Session(*ort_env, model->model_data.data(), model->model_data.size(), so));
+
+  // Find the JSON graph file
+  std::filesystem::path json_path;
+  for (const auto& entry : std::filesystem::directory_iterator{tmp_dir}) {
+    if (entry.is_regular_file() && entry.path().extension() == ".json" &&
+        entry.path().filename().string().find("_tensor_log") == std::string::npos) {
+      json_path = entry.path();
+      break;
+    }
+  }
+  ASSERT_FALSE(json_path.empty()) << "No JSON file found in " << tmp_dir;
+
+  // Parse JSON and extract tensor names with IDs
+  std::vector<std::pair<std::string, int>> inputs_with_id, outputs_with_id;
+  {
+    std::ifstream json_file(json_path);
+    ASSERT_TRUE(json_file.is_open());
+
+    nlohmann::json root;
+    json_file >> root;
+
+    for (const auto& [name, tensor] : root["graph"]["tensors"].items()) {
+      int type = tensor.value("type", -1);
+      int id = tensor.value("id", -1);
+      if (type == 0) {
+        inputs_with_id.emplace_back(name, id);  // QNN_TENSOR_TYPE_APP_WRITE
+      } else if (type == 1) {
+        outputs_with_id.emplace_back(name, id);  // QNN_TENSOR_TYPE_APP_READ
+      }
+    }
+  }
+
+  // Sort by tensor ID to recover registration order
+  std::sort(inputs_with_id.begin(), inputs_with_id.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; });
+  std::sort(outputs_with_id.begin(), outputs_with_id.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; });
+
+  std::vector<std::string> input_names, output_names;
+  for (const auto& [name, id] : inputs_with_id) {
+    input_names.push_back(name);
+  }
+  for (const auto& [name, id] : outputs_with_id) {
+    output_names.push_back(name);
+  }
+
+  // Verify correct count
+  ASSERT_EQ(input_names.size(), 3u) << "Expected 3 inputs";
+  ASSERT_EQ(output_names.size(), 3u) << "Expected 3 outputs";
+
+  // Verify all expected names are present
+  std::set<std::string> expected_input_set = {"i1", "i2", "i3"};
+  std::set<std::string> actual_input_set(input_names.begin(), input_names.end());
+  EXPECT_EQ(actual_input_set, expected_input_set);
+
+  std::set<std::string> expected_output_set = {"qdq1_out_dq_out", "qdq2_out_dq_out", "qdq3_out_dq_out"};
+  std::set<std::string> actual_output_set(output_names.begin(), output_names.end());
+  EXPECT_EQ(actual_output_set, expected_output_set);
+
+  // Verify ordering matches ONNX declaration: {i2, i1, i3} and {o2, o1, o3}
+  EXPECT_EQ(input_names[0], "i2");
+  EXPECT_EQ(input_names[1], "i1");
+  EXPECT_EQ(input_names[2], "i3");
+
+  EXPECT_EQ(output_names[0], "qdq2_out_dq_out");
+  EXPECT_EQ(output_names[1], "qdq1_out_dq_out");
+  EXPECT_EQ(output_names[2], "qdq3_out_dq_out");
+}
+
+// Verify GetUniqueName counter resets between compilations in the same process.
+TEST_F(QnnCPUBackendTests, GetUniqueNameResetBetweenCompilations) {
+  auto model_fn = BuildOpTestCase<float>(
+      "Sigmoid_node", "Sigmoid",
+      {TestInputDef<float>({1, 2, 3}, false, {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f})},
+      {}, {});
+
+  namespace fs = std::filesystem;
+  auto tmp_dir = fs::temp_directory_path() / "qnn_unique_name_test";
+  fs::create_directories(tmp_dir);
+
+  auto compile_and_get_node_names = [&](const std::string& sub_dir) -> std::unordered_set<std::string> {
+    auto json_dir = tmp_dir / sub_dir;
+    fs::create_directories(json_dir);
+
+    ProviderOptions provider_options;
+    provider_options["backend_type"] = "cpu";
+    provider_options["offload_graph_io_quantization"] = "0";
+    provider_options["dump_json_qnn_graph"] = "1";
+    provider_options["json_qnn_graph_dir"] = json_dir.string();
+
+    RunQnnModelTest(model_fn, provider_options, 13, EPVerificationParams{ExpectedEPNodeAssignment::All});
+
+    std::unordered_set<std::string> node_names;
+    for (const auto& entry : fs::directory_iterator(json_dir)) {
+      if (entry.path().extension() == ".json") {
+        std::ifstream ifs(entry.path());
+        nlohmann::json j;
+        ifs >> j;
+        for (auto& [name, _] : j["graph"]["nodes"].items()) {
+          node_names.insert(name);
+        }
+      }
+    }
+    return node_names;
+  };
+
+  auto names_1 = compile_and_get_node_names("run1");
+  auto names_2 = compile_and_get_node_names("run2");
+  fs::remove_all(tmp_dir);
+
+  ASSERT_FALSE(names_1.empty());
+  EXPECT_EQ(names_1, names_2);
+}
+
+// Test extended UDMA mode on supported hardware (should run successfully)
+#if defined(_WIN32)
+TEST_F(QnnHTPBackendTests, ExtendedUdmaModeTest) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V79);
+  // Create provider options with extended UDMA mode enabled
+  ProviderOptions options;
+  options["backend_type"] = "htp";
+  options["offload_graph_io_quantization"] = "0";
+  options["htp_arch"] = "81";
+  options["extended_udma"] = "1";
+
+  // Define a simple model with Add operation
+  auto input_defs = {TestInputDef<float>({1, 3, 4, 4}, false, -10.0f, 10.0f),
+                     TestInputDef<float>({1, 3, 4, 4}, false, -10.0f, 10.0f)};
+
+  // Run the test - this should succeed because v81 supports extended UDMA
+  RunQnnModelTest(BuildOpTestCase<float>("Add_node", "Add", input_defs, {}, {}, kOnnxDomain),
+                  options,
+                  13,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(0.008f)});
+}
+#endif  // defined(_WIN32)
+
+#if defined(_WIN32) && defined(_M_ARM64) && !BUILD_QNN_EP_STATIC_LIB
+// Tests that the QNN GPU shared memory allocator (DX12) can be created and used to allocate/free memory.
+// Requires the QNN GPU backend (QnnGpu.dll) and a D3D12-capable device.
+TEST_F(QnnGPUBackendTests, get_allocator_qnn_gpu_shared) {
+  ProviderOptions options;
+  options["backend_path"] = "QnnGpu.dll";
+  options["enable_dx12_shared_memory_allocator"] = "1";
+
+  Ort::SessionOptions session_options;
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, session_options, kQnnExecutionProvider, options);
+
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "capi_symbolic_dims.onnx";
+  Ort::Session session = Ort::Session{*ort_env, ort_model_path, session_options};
+
+  // Verify the shared memory allocator is accessible and functional.
+  Ort::MemoryInfo info_qnn_shared(nullptr);
+  Ort::Allocator qnn_gpu_shared_allocator(nullptr);
+  try {
+    // Note: "QnnHtpShared" allocator is the correct name even when using the GPU allocator. Eventually, the plan is to
+    // migrate to "QnnShared".
+    info_qnn_shared = Ort::MemoryInfo("QnnHtpShared", OrtAllocatorType::OrtDeviceAllocator, 0, OrtMemTypeCPU);
+    qnn_gpu_shared_allocator = Ort::Allocator(session, info_qnn_shared);
+  } catch (const Ort::Exception&) {
+    GTEST_SKIP() << "DX12 allocator unavailable (outdated drivers?). Skipping test.";
+  }
+
+  auto allocator_info = qnn_gpu_shared_allocator.GetInfo();
+  ASSERT_EQ(allocator_info, info_qnn_shared);
+
+  void* p = qnn_gpu_shared_allocator.Alloc(1024);
+  ASSERT_NE(p, nullptr);
+  qnn_gpu_shared_allocator.Free(p);
+
+  auto mem_allocation = qnn_gpu_shared_allocator.GetAllocation(1024);
+  ASSERT_NE(mem_allocation.get(), nullptr);
+  ASSERT_EQ(mem_allocation.size(), size_t{1024});
+}
+
+TEST_F(QnnGPUBackendTests, io_binding_qnn_gpu_shared) {
+  ProviderOptions options;
+  options["backend_path"] = "QnnGpu.dll";
+  options["enable_dx12_shared_memory_allocator"] = "1";
+
+  Ort::SessionOptions session_options;
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, session_options, kQnnExecutionProvider, options);
+
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "mul_1.onnx";
+  Ort::Session session = Ort::Session{*ort_env, ort_model_path, session_options};
+
+  Ort::MemoryInfo info_qnn_shared(nullptr);
+  Ort::Allocator qnn_gpu_shared_allocator(nullptr);
+  try {
+    // Note: "QnnHtpShared" allocator is the correct name even when using the GPU allocator. Eventually, the plan is to
+    // migrate to "QnnShared".
+    info_qnn_shared = Ort::MemoryInfo("QnnHtpShared", OrtAllocatorType::OrtDeviceAllocator, 0, OrtMemTypeCPU);
+    qnn_gpu_shared_allocator = Ort::Allocator(session, info_qnn_shared);
+  } catch (const Ort::Exception&) {
+    GTEST_SKIP() << "DX12 allocator unavailable (outdated drivers?). Skipping test.";
+  }
+
+  auto allocator_info = qnn_gpu_shared_allocator.GetInfo();
+  ASSERT_EQ(info_qnn_shared, allocator_info);
+
+  const std::array<int64_t, 2> x_shape = {3, 2};
+  std::array<float, 3 * 2> x_values = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+  auto input_data = qnn_gpu_shared_allocator.GetAllocation(x_values.size() * sizeof(float));
+  ASSERT_NE(input_data.get(), nullptr);
+  memcpy(input_data.get(), x_values.data(), sizeof(float) * x_values.size());
+
+  // Create an OrtValue tensor backed by data on QNN shared memory
+  Ort::Value bound_x = Ort::Value::CreateTensor(info_qnn_shared, reinterpret_cast<float*>(input_data.get()), x_values.size(),
+                                                x_shape.data(), x_shape.size());
+
+  const std::array<int64_t, 2> expected_y_shape = {3, 2};
+  const std::array<float, 3 * 2> expected_y = {1.0f, 4.0f, 9.0f, 16.0f, 25.0f, 36.0f};
+  constexpr float y_max_abs_err = 1e-5f;
+  auto output_data = qnn_gpu_shared_allocator.GetAllocation(expected_y.size() * sizeof(float));
+  ASSERT_NE(output_data.get(), nullptr);
+
+  // Create an OrtValue tensor backed by data on QNN shared memory
+  Ort::Value bound_y = Ort::Value::CreateTensor(info_qnn_shared, reinterpret_cast<float*>(output_data.get()),
+                                                expected_y.size(), expected_y_shape.data(), expected_y_shape.size());
+
+  Ort::IoBinding binding(session);
+  binding.BindInput("X", bound_x);
+  binding.BindOutput("Y", bound_y);
+
+  session.Run(Ort::RunOptions(), binding);
+
+  // Check the values against the bound raw memory
+  {
+    gsl::span y{reinterpret_cast<const float*>(output_data.get()), expected_y.size()};
+    EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), y));
+  }
+
+  // Now compare values via GetOutputValues
+  {
+    std::vector<Ort::Value> output_values = binding.GetOutputValues();
+    ASSERT_EQ(output_values.size(), 1U);
+    const Ort::Value& Y_value = output_values[0];
+    ASSERT_TRUE(Y_value.IsTensor());
+    Ort::TensorTypeAndShapeInfo type_info = Y_value.GetTensorTypeAndShapeInfo();
+    ASSERT_EQ(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, type_info.GetElementType());
+    auto count = type_info.GetElementCount();
+    ASSERT_EQ(expected_y.size(), count);
+
+    gsl::span y{Y_value.GetTensorData<float>(), count};
+    EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), y));
+  }
+
+  {
+    std::vector<std::string> output_names = binding.GetOutputNames();
+    ASSERT_EQ(1U, output_names.size());
+    ASSERT_EQ(output_names[0].compare("Y"), 0);
+  }
+
+  // Now replace binding of Y with an on device binding instead of pre-allocated memory.
+  // This is when we can not allocate an OrtValue due to unknown dimensions
+  {
+    binding.BindOutput("Y", info_qnn_shared);
+    session.Run(Ort::RunOptions(), binding);
+  }
+
+  // Check the output value allocated based on the device binding.
+  {
+    std::vector<Ort::Value> output_values = binding.GetOutputValues();
+    ASSERT_EQ(output_values.size(), 1U);
+    const Ort::Value& Y_value = output_values[0];
+    ASSERT_TRUE(Y_value.IsTensor());
+    Ort::TensorTypeAndShapeInfo type_info = Y_value.GetTensorTypeAndShapeInfo();
+    ASSERT_EQ(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, type_info.GetElementType());
+    auto count = type_info.GetElementCount();
+    ASSERT_EQ(expected_y.size(), count);
+
+    gsl::span y{Y_value.GetTensorData<float>(), count};
+    EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), y));
+  }
+
+  // Clean up
+  binding.ClearBoundInputs();
+  binding.ClearBoundOutputs();
+}
+
+// TODO: enable when DX12SharedMemoryAllocator supports tensors at nonzero offset within allocation
+TEST_F(QnnGPUBackendTests, DISABLED_io_binding_qnn_gpu_shared_offset) {
+  ProviderOptions options;
+  options["backend_path"] = "QnnGpu.dll";
+  options["enable_dx12_shared_memory_allocator"] = "1";
+
+  Ort::SessionOptions session_options;
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, session_options, kQnnExecutionProvider, options);
+
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "mul_1.onnx";
+  Ort::Session session = Ort::Session{*ort_env, ort_model_path, session_options};
+
+  // Note: "QnnHtpShared" allocator is the correct name even when using the GPU allocator. Eventually, the plan is to
+  // migrate to "QnnShared".
+  Ort::MemoryInfo info_qnn_shared("QnnHtpShared", OrtAllocatorType::OrtDeviceAllocator, 0, OrtMemTypeCPU);
+  Ort::Allocator qnn_gpu_shared_allocator(session, info_qnn_shared);
+  auto allocator_info = qnn_gpu_shared_allocator.GetInfo();
+  ASSERT_EQ(info_qnn_shared, allocator_info);
+
+  const std::array<int64_t, 2> x_shape = {3, 2};
+  std::array<float, 3 * 2> x_values = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+
+  const size_t x_allocation_offset_bytes = 4 * sizeof(float);
+  const size_t x_allocation_size_bytes = x_allocation_offset_bytes + x_values.size() * sizeof(float);
+
+  auto input_data_base = qnn_gpu_shared_allocator.GetAllocation(x_allocation_size_bytes);
+  ASSERT_NE(input_data_base.get(), nullptr);
+
+  auto input_data = reinterpret_cast<float*>(static_cast<uint8_t*>(input_data_base.get()) + x_allocation_offset_bytes);
+  memcpy(input_data, x_values.data(), sizeof(float) * x_values.size());
+
+  // Create an OrtValue tensor backed by data on QNN shared memory
+  Ort::Value bound_x = Ort::Value::CreateTensor(info_qnn_shared, input_data, x_values.size(),
+                                                x_shape.data(), x_shape.size());
+
+  const std::array<int64_t, 2> expected_y_shape = {3, 2};
+  const std::array<float, 3 * 2> expected_y = {1.0f, 4.0f, 9.0f, 16.0f, 25.0f, 36.0f};
+  constexpr float y_max_abs_err = 1e-5f;
+
+  const size_t y_allocation_offset_bytes = 4 * sizeof(float);
+  const size_t y_allocation_size_bytes = y_allocation_offset_bytes + expected_y.size() * sizeof(float);
+
+  auto output_data_base = qnn_gpu_shared_allocator.GetAllocation(y_allocation_size_bytes);
+  ASSERT_NE(output_data_base.get(), nullptr);
+
+  auto output_data = reinterpret_cast<float*>(static_cast<uint8_t*>(output_data_base.get()) + y_allocation_offset_bytes);
+
+  // Create an OrtValue tensor backed by data on QNN shared memory
+  Ort::Value bound_y = Ort::Value::CreateTensor(info_qnn_shared, output_data,
+                                                expected_y.size(), expected_y_shape.data(), expected_y_shape.size());
+
+  Ort::IoBinding binding(session);
+  binding.BindInput("X", bound_x);
+  binding.BindOutput("Y", bound_y);
+
+  session.Run(Ort::RunOptions(), binding);
+
+  // Check the values against the bound raw memory
+  {
+    gsl::span y{output_data, expected_y.size()};
+    EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), y));
+  }
+
+  // Now compare values via GetOutputValues
+  {
+    std::vector<Ort::Value> output_values = binding.GetOutputValues();
+    ASSERT_EQ(output_values.size(), 1U);
+    const Ort::Value& Y_value = output_values[0];
+    ASSERT_TRUE(Y_value.IsTensor());
+    Ort::TensorTypeAndShapeInfo type_info = Y_value.GetTensorTypeAndShapeInfo();
+    ASSERT_EQ(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, type_info.GetElementType());
+    auto count = type_info.GetElementCount();
+    ASSERT_EQ(expected_y.size(), count);
+
+    gsl::span y{Y_value.GetTensorData<float>(), count};
+    EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), y));
+  }
+
+  {
+    std::vector<std::string> output_names = binding.GetOutputNames();
+    ASSERT_EQ(1U, output_names.size());
+    ASSERT_EQ(output_names[0].compare("Y"), 0);
+  }
+
+  // Now replace binding of Y with an on device binding instead of pre-allocated memory.
+  // This is when we can not allocate an OrtValue due to unknown dimensions
+  {
+    binding.BindOutput("Y", info_qnn_shared);
+    session.Run(Ort::RunOptions(), binding);
+  }
+
+  // Check the output value allocated based on the device binding.
+  {
+    std::vector<Ort::Value> output_values = binding.GetOutputValues();
+    ASSERT_EQ(output_values.size(), 1U);
+    const Ort::Value& Y_value = output_values[0];
+    ASSERT_TRUE(Y_value.IsTensor());
+    Ort::TensorTypeAndShapeInfo type_info = Y_value.GetTensorTypeAndShapeInfo();
+    ASSERT_EQ(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, type_info.GetElementType());
+    auto count = type_info.GetElementCount();
+    ASSERT_EQ(expected_y.size(), count);
+
+    gsl::span y{Y_value.GetTensorData<float>(), count};
+    EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), y));
+  }
+
+  // Clean up
+  binding.ClearBoundInputs();
+  binding.ClearBoundOutputs();
+}
+
+/*
+ * Import external memory.
+ */
+TEST_F(QnnGPUBackendTests, import_memory_basic) {
+  ComPtr<ID3D12Device> d3d12device;
+  HRESULT hr = D3D12CreateDevice(
+      nullptr,
+      D3D_FEATURE_LEVEL_12_0,
+      IID_PPV_ARGS(&d3d12device));
+  ASSERT_FALSE(FAILED(hr) || d3d12device == nullptr);
+
+  ComPtr<ID3D12Resource> input_buffer;
+  UINT64 input_size = 16;
+  hr = CreateD3D12Buffer(
+      d3d12device.Get(),
+      input_size,
+      D3D12_HEAP_FLAG_SHARED,
+      D3D12_HEAP_TYPE_DEFAULT,
+      input_buffer.GetAddressOf());
+  ASSERT_FALSE(FAILED(hr) || input_buffer == nullptr);
+
+  HANDLE input_handle = nullptr;
+  hr = d3d12device->CreateSharedHandle(
+      input_buffer.Get(),
+      nullptr,
+      GENERIC_ALL,
+      nullptr,
+      &input_handle);
+  ASSERT_FALSE(FAILED(hr) || input_handle == nullptr);
+
+  Ort::SessionOptions session_options;
+  ProviderOptions options;
+  options["backend_path"] = "QnnGpu.dll";
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, session_options, kQnnExecutionProvider, options);
+  ASSERT_FALSE(registered_ep_device == nullptr);
+  OrtExternalResourceImporter* importer = nullptr;
+  ASSERT_ORTSTATUS_OK(Ort::GetInteropApi().CreateExternalResourceImporterForDevice(registered_ep_device.get(), &importer));
+  ASSERT_FALSE(importer == nullptr);
+
+  bool capability = false;
+  Ort::GetInteropApi().CanImportMemory(importer, ORT_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE, &capability);
+  ASSERT_TRUE(capability);
+  Ort::GetInteropApi().CanImportMemory(importer, ORT_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP, &capability);
+  ASSERT_FALSE(capability);
+  Ort::GetInteropApi().CanImportSemaphore(importer, ORT_EXTERNAL_SEMAPHORE_D3D12_FENCE, &capability);
+  ASSERT_FALSE(capability);
+
+  OrtExternalMemoryDescriptor input_desc;
+  input_desc.version = ORT_API_VERSION;
+  input_desc.handle_type = ORT_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE;
+  input_desc.native_handle = input_handle;
+  input_desc.size_bytes = input_size;
+  input_desc.offset_bytes = 0;
+  OrtExternalMemoryHandle* input_mem = nullptr;
+  Ort::GetInteropApi().ImportMemory(importer, &input_desc, &input_mem);
+  ASSERT_FALSE(input_mem == nullptr);
+
+  // cleanup
+  Ort::GetInteropApi().ReleaseExternalMemoryHandle(input_mem);
+  Ort::GetInteropApi().ReleaseExternalResourceImporter(importer);
+  CloseHandle(input_handle);
+}
+
+/*
+ * Use imported external memory for inferencing input.
+ */
+TEST_F(QnnGPUBackendTests, import_memory_inference_input) {
+  // input
+  const std::array<int64_t, 2> x_shape = {3, 2};
+  std::array<float, 3 * 2> x_values = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+
+  ComPtr<ID3D12Device> d3d12device;
+  HRESULT hr = D3D12CreateDevice(
+      nullptr,
+      D3D_FEATURE_LEVEL_12_0,
+      IID_PPV_ARGS(&d3d12device));
+  ASSERT_FALSE(FAILED(hr) || d3d12device == nullptr);
+
+  ComPtr<ID3D12Resource> input_buffer;
+  UINT64 input_size = sizeof(x_values);
+  hr = CreateD3D12Buffer(
+      d3d12device.Get(),
+      input_size,
+      D3D12_HEAP_FLAG_SHARED,
+      D3D12_HEAP_TYPE_DEFAULT,
+      input_buffer.GetAddressOf());
+  ASSERT_FALSE(FAILED(hr) || input_buffer == nullptr);
+
+  HANDLE input_handle = nullptr;
+  hr = d3d12device->CreateSharedHandle(
+      input_buffer.Get(),
+      nullptr,
+      GENERIC_ALL,
+      nullptr,
+      &input_handle);
+  ASSERT_FALSE(FAILED(hr) || input_handle == nullptr);
+
+  Ort::SessionOptions session_options;
+  ProviderOptions options;
+  options["backend_path"] = "QnnGpu.dll";
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, session_options, kQnnExecutionProvider, options);
+  ASSERT_FALSE(registered_ep_device == nullptr);
+  OrtExternalResourceImporter* importer = nullptr;
+  ASSERT_ORTSTATUS_OK(Ort::GetInteropApi().CreateExternalResourceImporterForDevice(registered_ep_device.get(), &importer));
+  ASSERT_FALSE(importer == nullptr);
+
+  bool capability = false;
+  Ort::GetInteropApi().CanImportMemory(importer, ORT_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE, &capability);
+  ASSERT_TRUE(capability);
+
+  OrtExternalMemoryDescriptor input_desc;
+  input_desc.version = ORT_API_VERSION;
+  input_desc.handle_type = ORT_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE;
+  input_desc.native_handle = input_handle;
+  input_desc.size_bytes = input_size;
+  input_desc.offset_bytes = 0;
+  OrtExternalMemoryHandle* input_mem_handle = nullptr;
+  Ort::GetInteropApi().ImportMemory(importer, &input_desc, &input_mem_handle);
+  ASSERT_FALSE(input_mem_handle == nullptr);
+
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "mul_1.onnx";
+  Ort::Session session = Ort::Session{*ort_env, ort_model_path, session_options};
+
+  OrtExternalTensorDescriptor input_tensor_desc;
+  input_tensor_desc.version = ORT_API_VERSION;
+  input_tensor_desc.element_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+  input_tensor_desc.shape = x_shape.data();
+  input_tensor_desc.rank = x_shape.size();
+  input_tensor_desc.offset_bytes = 0;
+  OrtValue* x_tensor = nullptr;
+  Ort::GetInteropApi().CreateTensorFromMemory(importer, input_mem_handle, &input_tensor_desc, &x_tensor);
+  ASSERT_FALSE(x_tensor == nullptr);
+
+  // Real use case imported memory would already contain input data from the gpu.
+  // Since ours doesn't we need to copy input data to it from the cpu.
+  // However it seems D3D12_HEAP_FLAG_SHARED & D3D12_HEAP_TYPE_UPLOAD does not seem to work.
+  // This means we cannot map the d3d buffer to CPU address space to copy input.
+  /*
+  {
+    void* cpu_mapped_ptr = nullptr;
+    hr = input_buffer->Map(0, nullptr, &cpu_mapped_ptr);
+    ASSERT_FALSE(FAILED(hr) || cpu_mapped_ptr == nullptr);
+    memcpy(cpu_mapped_ptr, x_values.data(), sizeof(x_values));
+  }
+  */
+
+  // Set up RunOptions
+  OrtRunOptions* run_options = nullptr;
+  Ort::GetApi().CreateRunOptions(&run_options);
+  // Run inference using simple Run() API (no IOBinding required)
+  const char* input_names[] = {"X"};
+  const char* output_names[] = {"Y"};
+  const OrtValue* inputs[] = {x_tensor};
+  OrtValue* outputs[] = {nullptr};
+  auto status = Ort::GetApi().Run(session, run_options, input_names, inputs, 1, output_names, 1, outputs);
+  ASSERT_TRUE(status == nullptr);
+
+  // check the output attributes
+  ASSERT_FALSE(outputs[0] == nullptr);
+  const auto* y_tensor = outputs[0];
+  OrtTensorTypeAndShapeInfo* y_info;
+  Ort::GetApi().GetTensorTypeAndShape(y_tensor, &y_info);
+  ASSERT_FALSE(y_info == nullptr);
+  size_t count = 0;
+  Ort::GetApi().GetTensorShapeElementCount(y_info, &count);
+  ASSERT_FALSE(count == 0);
+  const float* y = nullptr;
+  Ort::GetApi().GetTensorData(y_tensor, &(const void*)y);
+  ASSERT_FALSE(y == nullptr);
+
+  // Compare the actual output values to the expected output values.
+  // However since input values could not be provided (see above Map), we cannot compare output values.
+  /*
+  {
+    const std::array<int64_t, 2> expected_y_shape = {3, 2};
+    const std::array<float, 3 * 2> expected_y = {1.0f, 4.0f, 9.0f, 16.0f, 25.0f, 36.0f};
+
+    ASSERT_EQ(expected_y.size(), count);
+    constexpr float y_max_abs_err = 1e-5f;
+    EXPECT_THAT(expected_y, ::testing::Pointwise(::testing::FloatNear(y_max_abs_err), gsl::span(y, count)));
+  }
+  */
+
+  // cleanup
+  Ort::GetApi().ReleaseValue(x_tensor);
+  Ort::GetInteropApi().ReleaseExternalMemoryHandle(input_mem_handle);
+  Ort::GetInteropApi().ReleaseExternalResourceImporter(importer);
+  CloseHandle(input_handle);
+}
+
+/*
+ * Use imported external memory for first inferencing output.
+ * Then use imported external memory for second inferencing input.
+ * Then compare the output values of second inferencing.
+ * Two inference need to be run this way because we cannot copy input to
+ * the imported external memory from the cpu.
+ */
+TEST_F(QnnGPUBackendTests, import_memory_inference_output_input) {
+  // ---------------------- create gpu session
+  Ort::SessionOptions session_options;
+  ProviderOptions options;
+  options["backend_path"] = "QnnGpu.dll";
+  RegisteredEpDeviceUniquePtr registered_ep_device;
+  RegisterQnnEpLibrary(registered_ep_device, session_options, kQnnExecutionProvider, options);
+  ASSERT_FALSE(registered_ep_device == nullptr);
+  OrtExternalResourceImporter* importer = nullptr;
+  const ORTCHAR_T* ort_model_path = ORT_MODEL_FOLDER "mul_1.onnx";
+  Ort::Session session = Ort::Session{*ort_env, ort_model_path, session_options};
+
+  // ---------------------- prepare tensor for input stage 1
+  const std::array<int64_t, 2> x_shape = {3, 2};
+  std::array<float, 3 * 2> x_values = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+  OrtValue* x_tensor = nullptr;
+  OrtMemoryInfo* meminfo = nullptr;
+  Ort::GetApi().CreateMemoryInfo("Cpu", OrtArenaAllocator, 0, OrtMemTypeCPU, &meminfo);
+  ASSERT_FALSE(meminfo == nullptr);
+  Ort::GetApi().CreateTensorWithDataAsOrtValue(
+      meminfo, x_values.data(), sizeof(x_values), x_shape.data(), x_shape.size(),
+      ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &x_tensor);
+
+  // ---------------------- prepare tensor for output stage 1
+  const std::array<int64_t, 2> expected_y_shape = {3, 2};
+  const std::array<float, 3 * 2> expected_y_values = {1.0f, 4.0f, 9.0f, 16.0f, 25.0f, 36.0f};
+
+  ComPtr<ID3D12Device> d3d12device;
+  HRESULT hr = D3D12CreateDevice(
+      nullptr,
+      D3D_FEATURE_LEVEL_12_0,
+      IID_PPV_ARGS(&d3d12device));
+  ASSERT_FALSE(FAILED(hr) || d3d12device == nullptr);
+
+  ComPtr<ID3D12Resource> d3d12buffer;
+  UINT64 d3d12buffer_size = sizeof(expected_y_values);
+  hr = CreateD3D12Buffer(
+      d3d12device.Get(),
+      d3d12buffer_size,
+      D3D12_HEAP_FLAG_SHARED,
+      D3D12_HEAP_TYPE_DEFAULT,
+      d3d12buffer.GetAddressOf());
+  ASSERT_FALSE(FAILED(hr) || d3d12buffer == nullptr);
+
+  HANDLE d3d12buffer_shared_handle = nullptr;
+  hr = d3d12device->CreateSharedHandle(
+      d3d12buffer.Get(),
+      nullptr,
+      GENERIC_ALL,
+      nullptr,
+      &d3d12buffer_shared_handle);
+  ASSERT_FALSE(FAILED(hr) || d3d12buffer_shared_handle == nullptr);
+
+  ASSERT_ORTSTATUS_OK(Ort::GetInteropApi().CreateExternalResourceImporterForDevice(registered_ep_device.get(), &importer));
+  ASSERT_FALSE(importer == nullptr);
+
+  bool capability = false;
+  Ort::GetInteropApi().CanImportMemory(importer, ORT_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE, &capability);
+  ASSERT_TRUE(capability);
+
+  OrtExternalMemoryDescriptor import_mem_desc;
+  import_mem_desc.version = ORT_API_VERSION;
+  import_mem_desc.handle_type = ORT_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE;
+  import_mem_desc.native_handle = d3d12buffer_shared_handle;
+  import_mem_desc.size_bytes = d3d12buffer_size;
+  import_mem_desc.offset_bytes = 0;
+  OrtExternalMemoryHandle* import_mem_handle = nullptr;
+  Ort::GetInteropApi().ImportMemory(importer, &import_mem_desc, &import_mem_handle);
+  ASSERT_FALSE(import_mem_handle == nullptr);
+
+  OrtExternalTensorDescriptor import_mem_tensor_desc;
+  import_mem_tensor_desc.version = ORT_API_VERSION;
+  import_mem_tensor_desc.element_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+  import_mem_tensor_desc.shape = x_shape.data();
+  import_mem_tensor_desc.rank = x_shape.size();
+  import_mem_tensor_desc.offset_bytes = 0;
+  OrtValue* y_tensor = nullptr;
+  Ort::GetInteropApi().CreateTensorFromMemory(importer, import_mem_handle, &import_mem_tensor_desc, &y_tensor);
+  ASSERT_FALSE(y_tensor == nullptr);
+
+  // ---------------------- run inference stage 1
+  OrtRunOptions* run_options = nullptr;
+  Ort::GetApi().CreateRunOptions(&run_options);
+  // Run inference using simple Run() API (no IOBinding required)
+  const char* input_names[] = {"X"};
+  const char* output_names[] = {"Y"};
+  const OrtValue* inputs[] = {x_tensor};
+  OrtValue* outputs[] = {y_tensor};
+  auto status = Ort::GetApi().Run(session, run_options, input_names, inputs, 1, output_names, 1, outputs);
+  ASSERT_TRUE(status == nullptr);
+
+  // ---------------------- check the stage 1 run output attributes
+  ASSERT_TRUE(outputs[0] == y_tensor);
+  OrtTensorTypeAndShapeInfo* y_info;
+  Ort::GetApi().GetTensorTypeAndShape(y_tensor, &y_info);
+  ASSERT_FALSE(y_info == nullptr);
+  size_t count = 0;
+  Ort::GetApi().GetTensorShapeElementCount(y_info, &count);
+  ASSERT_FALSE(count == 0);
+  // The following cannot work because there is no cpu map of d3d12buffer.
+  /*
+  const float* y = nullptr;
+  Ort::GetApi().GetTensorData(y_tensor, &(const void*)y);
+  ASSERT_FALSE(y == nullptr);
+  */
+
+  // ---------------------- run inference stage 2
+  inputs[0] = y_tensor;
+  outputs[0] = nullptr;
+  status = Ort::GetApi().Run(session, run_options, input_names, inputs, 1, output_names, 1, outputs);
+  ASSERT_TRUE(status == nullptr);
+
+  // ---------------------- check the stage 2 run output attributes
+  ASSERT_FALSE(outputs[0] == nullptr);
+  const auto* z_tensor = outputs[0];
+  OrtTensorTypeAndShapeInfo* z_info;
+  Ort::GetApi().GetTensorTypeAndShape(z_tensor, &z_info);
+  ASSERT_FALSE(z_info == nullptr);
+  count = 0;
+  Ort::GetApi().GetTensorShapeElementCount(z_info, &count);
+  ASSERT_FALSE(count == 0);
+  const float* z = nullptr;
+  Ort::GetApi().GetTensorData(z_tensor, &(const void*)z);
+  ASSERT_FALSE(z == nullptr);
+
+  // ---------------------- Compare the actual output values to the expected output values.
+  const std::array<int64_t, 2> expected_z_shape = {3, 2};
+  const std::array<float, 3 * 2> expected_z = {1.0f, 8.0f, 27.0f, 64.0f, 125.0f, 216.0f};
+
+  ASSERT_EQ(expected_z.size(), count);
+  constexpr float z_max_abs_err = 1e-5f;
+  EXPECT_THAT(expected_z, ::testing::Pointwise(::testing::FloatNear(z_max_abs_err), gsl::span(z, count)));
+
+  // cleanup
+  Ort::GetApi().ReleaseValue(y_tensor);
+  Ort::GetInteropApi().ReleaseExternalMemoryHandle(import_mem_handle);
+  Ort::GetInteropApi().ReleaseExternalResourceImporter(importer);
+  CloseHandle(d3d12buffer_shared_handle);
+}
+
+// Test that the QNN EP can execute a graph with no runtime inputs if using the GPU backend.
+TEST_F(QnnGPUBackendTests, ConstantOnlyGraph) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "gpu";
+
+  // Float16 Abs with a constant tensor is not folded by ORT Core because it has no CPU kernel.
+  RunQnnModelTest(
+      BuildOpTestCase<Ort::Float16_t>(
+          "abs_node", "Abs",
+          {TestInputDef<Ort::Float16_t>({6}, true,
+                                        {Ort::Float16_t(-3.0f), Ort::Float16_t(-2.0f), Ort::Float16_t(-1.0f),
+                                         Ort::Float16_t(0.0f), Ort::Float16_t(1.0f), Ort::Float16_t(2.0f)})},
+          {}, {}),
+      provider_options,
+      13,
+      EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(0.001f)});
+}
+#endif  // defined(_WIN32) && defined(_M_ARM64) && !BUILD_QNN_EP_STATIC_LIB
+
+// ============================ QNN EP input graph dump ============================
+//
+// `dump_qnn_ep_input_graph` writes the ONNX graph the EP receives at compile
+// time (after ORT Level 1 optimizations, before partitioning) as a JSON file in
+// the same QNN-Netron schema used by `dump_json_qnn_graph`. These tests run a
+// small model on the CPU backend, then parse and validate the emitted JSON.
+//
+// Why JSON (QNN Netron schema) and not a real .onnx: the QNN EP is a standalone
+// ABI plugin that links only the public ORT C/C++ API + Abseil + nlohmann/json
+// (see cmake/onnxruntime_providers_qnn.cmake) and intentionally does NOT link
+// protobuf / onnx proto, so it cannot construct or serialize an onnx::ModelProto.
+// nlohmann/json is already a plugin dependency and the schema is Netron-openable,
+// so reusing it adds zero dependencies. (The test binary itself DOES link onnx
+// proto, which is why these tests can build real models to feed the EP.)
+
+namespace {
+
+// Returns the first "*_qnn_ep_input_graph.json" file in `dir`, or {} if none.
+std::filesystem::path FindQnnEpInputGraphDump(const std::filesystem::path& dir) {
+  if (!std::filesystem::exists(dir)) return {};
+  for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+    if (entry.path().extension() == ".json" &&
+        entry.path().stem().string().find("_qnn_ep_input_graph") != std::string::npos) {
+      return entry.path();
+    }
+  }
+  return {};
+}
+
+}  // namespace
+
+// Pure-function tests for SanitizeGraphNameForFilename. These do not need to
+// drive the EP because the helper is exposed in the dumper header. The intent
+// is to lock down: (a) path-separator characters cannot escape the dump
+// directory, (b) Windows-illegal characters are replaced, (c) parent-dir
+// references (`..`) cannot survive, (d) Windows-reserved device names get
+// suffixed so they do not collide with the device-name handler, and
+// (e) sanitized output combined with `<dump_dir> / sanitized` always lands
+// inside `<dump_dir>` (lexical containment check).
+TEST(QnnEpInputGraphDumperTest, SanitizeGraphName_ReplacesPathSeparators) {
+  EXPECT_EQ(qnn::SanitizeGraphNameForFilename("model/encoder/layer.0/Add"),
+            "model_encoder_layer.0_Add");
+}
+
+TEST(QnnEpInputGraphDumperTest, SanitizeGraphName_ReplacesWindowsIllegal) {
+  EXPECT_EQ(qnn::SanitizeGraphNameForFilename("a:b*c?d|e<f>g\"h"),
+            "a_b_c_d_e_f_g_h");
+}
+
+TEST(QnnEpInputGraphDumperTest, SanitizeGraphName_StripsLeadingDotsAndDashes) {
+  // `..foo` must not survive as a parent-dir reference. Leading `-` is
+  // stripped so the result cannot resemble an argument flag if it ever
+  // round-trips through a CLI.
+  EXPECT_EQ(qnn::SanitizeGraphNameForFilename("..foo"), "foo");
+  EXPECT_EQ(qnn::SanitizeGraphNameForFilename("-rf"), "rf");
+  EXPECT_EQ(qnn::SanitizeGraphNameForFilename(".."), "graph");
+  EXPECT_EQ(qnn::SanitizeGraphNameForFilename("."), "graph");
+}
+
+TEST(QnnEpInputGraphDumperTest, SanitizeGraphName_DropsTrailingDot) {
+  // Trailing dots are explicitly stripped because Windows treats them as
+  // ignorable. Trailing space is already replaced with `_` by the safe-set
+  // pass before the trim runs, so it never reaches the trim — the
+  // `"foo. "` case below documents that contract.
+  EXPECT_EQ(qnn::SanitizeGraphNameForFilename("foo. "), "foo._");
+  EXPECT_EQ(qnn::SanitizeGraphNameForFilename("foo.bar."), "foo.bar");
+  EXPECT_EQ(qnn::SanitizeGraphNameForFilename("foo..."), "foo");
+}
+
+TEST(QnnEpInputGraphDumperTest, SanitizeGraphName_AvoidsWindowsReservedNames) {
+  EXPECT_EQ(qnn::SanitizeGraphNameForFilename("CON"), "CON_");
+  EXPECT_EQ(qnn::SanitizeGraphNameForFilename("nul"), "nul_");
+  EXPECT_EQ(qnn::SanitizeGraphNameForFilename("COM1"), "COM1_");
+  EXPECT_EQ(qnn::SanitizeGraphNameForFilename("CON.json"), "CON_.json");
+  // A reserved-looking stem inside a longer name is fine.
+  EXPECT_EQ(qnn::SanitizeGraphNameForFilename("CONSOLE"), "CONSOLE");
+}
+
+TEST(QnnEpInputGraphDumperTest, SanitizeGraphName_LandsInsideDumpDir) {
+  // For any sanitized name N, `dump_dir / (N + suffix)`.lexically_normal()
+  // must remain a child of `dump_dir`. This is the containment invariant
+  // the dumper relies on so a hostile graph name (path separators, parent
+  // refs, drive prefixes) cannot redirect output outside the configured
+  // dump directory.
+  std::filesystem::path dump_dir = std::filesystem::temp_directory_path() / "qnn_dump_root";
+  for (const char* raw : {"model/encoder/Add",
+                          "../../etc/passwd",
+                          "C:\\Windows\\System32",
+                          "..",
+                          "CON",
+                          "graph.with.dots",
+                          ""}) {
+    std::string sanitized = qnn::SanitizeGraphNameForFilename(raw);
+    std::filesystem::path joined =
+        (dump_dir / (sanitized + "_qnn_ep_input_graph.json")).lexically_normal();
+    auto dump_root = dump_dir.lexically_normal();
+    auto joined_str = joined.string();
+    auto root_str = dump_root.string();
+    EXPECT_EQ(joined_str.rfind(root_str, 0), 0u)
+        << "graph name '" << raw << "' produced path '" << joined_str
+        << "' which escapes dump root '" << root_str << "'";
+    EXPECT_EQ(joined.parent_path().lexically_normal(), dump_root)
+        << "graph name '" << raw << "' produced parent != dump root";
+  }
+}
+
+// Run a tiny float model with the dump enabled and validate the emitted JSON
+// structure: the 8 top-level QNN-Netron keys, node entries keyed by name with
+// type/input_names/output_names, and tensor entries keyed by name with
+// id/type/data_type/dims.
+TEST_F(QnnCPUBackendTests, DumpQnnEpInputGraph_BasicStructure) {
+  const std::filesystem::path dump_dir =
+      std::filesystem::temp_directory_path() / "qnn_ep_input_graph_basic";
+  std::error_code ec;
+  std::filesystem::remove_all(dump_dir, ec);
+  std::filesystem::create_directories(dump_dir);
+
+  ProviderOptions options;
+  options["backend_type"] = "cpu";
+  options["offload_graph_io_quantization"] = "0";
+  options["dump_qnn_ep_input_graph"] = "1";
+  options["dump_qnn_ep_input_graph_dir"] = dump_dir.string();
+
+  std::vector<float> data = GetFloatDataInRange(-10.0f, 10.0f, 6);
+  RunQnnModelTest(BuildOpTestCase<float>("add_node", "Add",
+                                         {TestInputDef<float>({1, 2, 3}, false, data),
+                                          TestInputDef<float>({1, 2, 3}, false, data)},
+                                         {}, {}, kOnnxDomain),
+                  options, 13, EPVerificationParams{ExpectedEPNodeAssignment::All});
+
+  if (::testing::UnitTest::GetInstance()->current_test_info()->result()->Skipped()) {
+    std::filesystem::remove_all(dump_dir, ec);
+    return;
+  }
+
+  std::filesystem::path dump_file = FindQnnEpInputGraphDump(dump_dir);
+  ASSERT_FALSE(dump_file.empty()) << "No *_qnn_ep_input_graph.json written in " << dump_dir;
+
+  std::ifstream ifs(dump_file);
+  ASSERT_TRUE(ifs.is_open());
+  nlohmann::json j = nlohmann::json::parse(ifs, nullptr, false);
+  ASSERT_FALSE(j.is_discarded()) << "dump is not valid JSON: " << dump_file;
+
+  // 8 top-level QNN-Netron keys.
+  for (const char* key : {"model.cpp", "model.bin", "converter_command", "copyright_str",
+                          "op_types", "Total parameters", "Total MACs per inference", "graph"}) {
+    EXPECT_TRUE(j.contains(key)) << "missing top-level key: " << key;
+  }
+  ASSERT_TRUE(j["graph"].contains("nodes"));
+  ASSERT_TRUE(j["graph"].contains("tensors"));
+  EXPECT_GE(j["graph"]["nodes"].size(), 1u);
+  EXPECT_GE(j["graph"]["tensors"].size(), 1u);
+
+  // Every node entry carries the Netron-required fields.
+  for (auto it = j["graph"]["nodes"].begin(); it != j["graph"]["nodes"].end(); ++it) {
+    const auto& node = it.value();
+    EXPECT_TRUE(node.contains("type"));
+    EXPECT_TRUE(node.contains("input_names"));
+    EXPECT_TRUE(node.contains("output_names"));
+    EXPECT_TRUE(node["input_names"].is_array());
+    EXPECT_TRUE(node["output_names"].is_array());
+  }
+
+  // Every tensor entry carries id/type/data_type/dims.
+  for (auto it = j["graph"]["tensors"].begin(); it != j["graph"]["tensors"].end(); ++it) {
+    const auto& tensor = it.value();
+    EXPECT_TRUE(tensor.contains("id"));
+    EXPECT_TRUE(tensor.contains("type"));
+    EXPECT_TRUE(tensor.contains("data_type"));
+    EXPECT_TRUE(tensor.contains("dims"));
+    EXPECT_TRUE(tensor["dims"].is_array());
+  }
+
+  std::filesystem::remove_all(dump_dir, ec);
+}
+
+// Validate that graph inputs, outputs, and initializers are classified with the
+// QNN tensor-type integers Netron expects (APP_WRITE=0, APP_READ=1, STATIC=4).
+TEST_F(QnnCPUBackendTests, DumpQnnEpInputGraph_TensorClassification) {
+  const std::filesystem::path dump_dir =
+      std::filesystem::temp_directory_path() / "qnn_ep_input_graph_classify";
+  std::error_code ec;
+  std::filesystem::remove_all(dump_dir, ec);
+  std::filesystem::create_directories(dump_dir);
+
+  ProviderOptions options;
+  options["backend_type"] = "cpu";
+  options["offload_graph_io_quantization"] = "0";
+  options["dump_qnn_ep_input_graph"] = "1";
+  options["dump_qnn_ep_input_graph_dir"] = dump_dir.string();
+
+  // Add with a constant initializer as the second input, so the dump contains
+  // a graph input (APP_WRITE), a graph output (APP_READ), and an initializer
+  // (STATIC).
+  std::vector<float> input_data = GetFloatDataInRange(-10.0f, 10.0f, 6);
+  std::vector<float> init_data = GetFloatDataInRange(-1.0f, 1.0f, 6);
+  RunQnnModelTest(BuildOpTestCase<float, float>("add_node", "Add",
+                                                {TestInputDef<float>({1, 2, 3}, false, input_data)},
+                                                {TestInputDef<float>({1, 2, 3}, true, init_data)},
+                                                {}, kOnnxDomain),
+                  options, 13, EPVerificationParams{ExpectedEPNodeAssignment::All});
+
+  if (::testing::UnitTest::GetInstance()->current_test_info()->result()->Skipped()) {
+    std::filesystem::remove_all(dump_dir, ec);
+    return;
+  }
+
+  std::filesystem::path dump_file = FindQnnEpInputGraphDump(dump_dir);
+  ASSERT_FALSE(dump_file.empty()) << "No dump written in " << dump_dir;
+  std::ifstream ifs(dump_file);
+  nlohmann::json j = nlohmann::json::parse(ifs, nullptr, false);
+  ASSERT_FALSE(j.is_discarded());
+
+  // Collect the set of tensor-type integers present. We expect at least one
+  // graph input (0), one graph output (1), and one initializer (4).
+  std::unordered_set<int> seen_types;
+  for (auto it = j["graph"]["tensors"].begin(); it != j["graph"]["tensors"].end(); ++it) {
+    seen_types.insert(it.value()["type"].get<int>());
+  }
+  EXPECT_TRUE(seen_types.count(0)) << "expected an APP_WRITE (graph input) tensor";
+  EXPECT_TRUE(seen_types.count(1)) << "expected an APP_READ (graph output) tensor";
+  EXPECT_TRUE(seen_types.count(4)) << "expected a STATIC (initializer) tensor";
+
+  std::filesystem::remove_all(dump_dir, ec);
+}
+
+// With the option disabled (default), no dump file is written.
+TEST_F(QnnCPUBackendTests, DumpQnnEpInputGraph_DisabledByDefault) {
+  const std::filesystem::path dump_dir =
+      std::filesystem::temp_directory_path() / "qnn_ep_input_graph_disabled";
+  std::error_code ec;
+  std::filesystem::remove_all(dump_dir, ec);
+  std::filesystem::create_directories(dump_dir);
+
+  ProviderOptions options;
+  options["backend_type"] = "cpu";
+  options["offload_graph_io_quantization"] = "0";
+  // Pin the dump directory to a scoped temp dir while leaving
+  // dump_qnn_ep_input_graph unset. Setting only the directory makes the
+  // assertion below catch a regression that flips the default to enabled:
+  // such a regression would write into this directory and trip the empty()
+  // check, instead of silently writing into the test's CWD where the helper
+  // would never look.
+  options["dump_qnn_ep_input_graph_dir"] = dump_dir.string();
+
+  std::vector<float> data = GetFloatDataInRange(-10.0f, 10.0f, 6);
+  RunQnnModelTest(BuildOpTestCase<float>("add_node", "Add",
+                                         {TestInputDef<float>({1, 2, 3}, false, data),
+                                          TestInputDef<float>({1, 2, 3}, false, data)},
+                                         {}, {}, kOnnxDomain),
+                  options, 13, EPVerificationParams{ExpectedEPNodeAssignment::All});
+
+  if (::testing::UnitTest::GetInstance()->current_test_info()->result()->Skipped()) {
+    std::filesystem::remove_all(dump_dir, ec);
+    return;
+  }
+
+  EXPECT_TRUE(FindQnnEpInputGraphDump(dump_dir).empty())
+      << "dump file written even though dump_qnn_ep_input_graph was not enabled";
+
+  std::filesystem::remove_all(dump_dir, ec);
+}
+
+#endif  // !defined(ORT_MINIMAL_BUILD)
+
+}  // namespace test
+}  // namespace onnxruntime

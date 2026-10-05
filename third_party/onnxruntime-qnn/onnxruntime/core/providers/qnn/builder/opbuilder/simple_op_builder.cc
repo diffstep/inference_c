@@ -1,0 +1,594 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#include "core/providers/qnn/builder/op_builder_factory.h"
+#include "core/providers/qnn/builder/opbuilder/base_op_builder.h"
+#include "core/providers/qnn/builder/qnn_model_wrapper.h"
+#include "core/providers/qnn/builder/qnn_utils.h"
+#include "core/providers/qnn/common/qnn_graph_utils.h"
+
+namespace onnxruntime {
+namespace qnn {
+
+// Operator which only need to handle node inputs & outputs, no attributes or no need to handle attributes
+class SimpleOpBuilder : public BaseOpBuilder {
+ public:
+  SimpleOpBuilder() : BaseOpBuilder("SimpleOpBuilder") {}
+  ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(SimpleOpBuilder);
+
+ protected:
+  Ort::Status ProcessAttributesAndOutputs(QnnModelWrapper& qnn_model_wrapper,
+                                          const OrtNodeUnit& node_unit,
+                                          std::vector<std::string>&& input_names,
+                                          const Ort::Logger& logger,
+                                          bool do_op_validation) const override ORT_MUST_USE_RESULT;
+  Ort::Status OverrideOutputQuantParam(QnnModelWrapper& qnn_model_wrapper,
+                                       const OrtNodeUnit& node_unit,
+                                       const Ort::Logger& logger,
+                                       const std::vector<std::string>& input_names,
+                                       size_t output_index,
+                                       Qnn_DataType_t qnn_data_type,
+                                       QnnQuantParamsWrapper& quant_param) const override ORT_MUST_USE_RESULT;
+
+ private:
+  Ort::Status ExplicitOpCheck(QnnModelWrapper& qnn_model_wrapper, const OrtNodeUnit& node_unit) const;
+  Ort::Status ProcessSigmoidOrTanhOutput(QnnModelWrapper& qnn_model_wrapper,
+                                         const OrtNodeUnit& node_unit,
+                                         std::vector<std::string>&& input_names,
+                                         std::vector<std::string>&& param_tensor_names,
+                                         const Ort::Logger& logger,
+                                         bool do_op_validation) const ORT_MUST_USE_RESULT;
+
+  static constexpr std::array<std::string_view, 3> gridsample_supported_modes = {"bilinear", "nearest", "linear"};
+  static constexpr std::array<std::string_view, 3> gridsample_supported_padding_modes = {"zeros", "border", "reflection"};
+};
+
+Ort::Status SimpleOpBuilder::ExplicitOpCheck(QnnModelWrapper& qnn_model_wrapper, const OrtNodeUnit& node_unit) const {
+  const std::string& op_type = node_unit.OpType();
+
+  if (op_type == "GridSample") {
+    OrtNodeAttrHelper node_helper(node_unit);
+    std::string mode = node_helper.Get("mode", "linear");
+    RETURN_IF_NOT(utils::ArrayHasString(gridsample_supported_modes, mode),
+                  ("GridSample does not support mode " + mode).c_str());
+    std::string padding_mode = node_helper.Get("padding_mode", "zeros");
+    RETURN_IF_NOT(utils::ArrayHasString(gridsample_supported_padding_modes, padding_mode),
+                  ("GridSample does not support padding_mode " + padding_mode).c_str());
+  }
+
+  const auto qnn_backend_type = qnn_model_wrapper.GetQnnBackendType();
+
+  // TODO: Remove once QNN HTP PRelu bug is fixed
+  if (op_type == "PRelu") {
+    RETURN_IF(qnn_backend_type == QnnBackendType::CPU,
+              "QNN EP does not support PRelu op on CPU backend. Falling back to ORT CPU.");
+  }
+
+  // ONNX Min/Max/Sum are variadic. QNN's fine-grained Minimum/Maximum/Add ops take exactly 2 inputs.
+  // The 2-input case maps to a single QNN op node; >2-input cases are decomposed into a
+  // left-folded chain of those QNN ops (see ProcessVariadicToBinaryChain).
+  if (op_type == "Min" || op_type == "Max" || op_type == "Sum") {
+    RETURN_IF_NOT(node_unit.Inputs().size() >= 2,
+                  ("QNN EP requires " + op_type + " to have at least 2 inputs.").c_str());
+  }
+
+  if (op_type == "DequantizeLinear") {
+    bool is_per_chan_quant = false;
+    int64_t quant_axis = 0;
+    RETURN_IF_ERROR(qnn_model_wrapper.IsPerChannelQuantized(node_unit.Inputs()[0], is_per_chan_quant, quant_axis));
+    RETURN_IF(is_per_chan_quant, "QNN EP does not support a standalone DQ op with per-channel quantization");
+
+    if (qnn_model_wrapper.GetModelSettings().offload_graph_io_quantization &&
+        qnn_model_wrapper.IsGraphOutput(node_unit.Outputs()[0].name)) {
+      // Only register the override for the first DQ node that consumes this graph output.
+      // If another DQ node already maps to the same external name, skip registration so
+      // that the second output becomes a separate APP_READ tensor instead of creating
+      // two APP_READ tensors with the same external name (which reduces the composed
+      // QNN graph's input count and causes a null slot in qnn_tensor_infos at runtime).
+      if (!qnn_model_wrapper.IsExternalOverrideTarget(node_unit.Outputs()[0].name)) {
+        // The tensor name override is used to align the output name of DLC produced by IRBackend
+        // with the output name of original onnx graph for better consistency.
+        qnn_model_wrapper.SetTensorNameOverride(/*internal=*/node_unit.Inputs()[0].name,
+                                                /*external=*/node_unit.Outputs()[0].name);
+      }
+      return MAKE_EP_FAIL("QNN EP is configured to not take DQ nodes that generate a graph output.");
+    }
+  }
+
+  if (op_type == "QuantizeLinear") {
+    bool is_per_chan_quant = false;
+    int64_t quant_axis = 0;
+    RETURN_IF_ERROR(qnn_model_wrapper.IsPerChannelQuantized(node_unit.Outputs()[0], is_per_chan_quant, quant_axis));
+    RETURN_IF(is_per_chan_quant, "QNN EP does not support a standalone Q op with per-channel quantization");
+
+    if (qnn_model_wrapper.GetModelSettings().offload_graph_io_quantization &&
+        qnn_model_wrapper.IsGraphInput(node_unit.Inputs()[0].name)) {
+      // Only register the override for the first Q node that consumes this graph input.
+      // If another Q node already maps to the same external name, skip registration so
+      // that the second input becomes a separate APP_WRITE tensor instead of creating
+      // two APP_WRITE tensors with the same external name (which reduces the composed
+      // QNN graph's input count and causes a null slot in qnn_tensor_infos at runtime).
+      if (!qnn_model_wrapper.IsExternalOverrideTarget(node_unit.Inputs()[0].name)) {
+        // The tensor name override is used to align the input name of DLC produced by IRBackend
+        // with the input name of original onnx graph for better consistency.
+        qnn_model_wrapper.SetTensorNameOverride(/*internal=*/node_unit.Outputs()[0].name,
+                                                /*external=*/node_unit.Inputs()[0].name);
+      }
+      return MAKE_EP_FAIL("QNN EP is configured to not take Q nodes that consume a graph input.");
+    }
+  }
+
+  if (op_type == "Softplus" && qnn_backend_type != QnnBackendType::CPU) {
+    TensorInfo input_info = {};
+    RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(node_unit.Inputs()[0], input_info));
+    RETURN_IF(input_info.shape.size() > 4,
+              "QNN EP does not support Softplus with input rank > 4.");
+  }
+
+  return Ort::Status();
+}
+
+// Limit to float type for now
+Ort::Status ProcessNodeAttribute(QnnModelWrapper& qnn_model_wrapper,
+                                 const OrtNodeUnit& node_unit,
+                                 const std::string& onnx_attr_key,
+                                 const std::string& qnn_param_key,
+                                 std::vector<std::string>& param_tensor_names,
+                                 const float default_value = 1.0f) {
+  OrtNodeAttrHelper node_helper(node_unit);
+  float attr_value = node_helper.Get(onnx_attr_key, default_value);
+  RETURN_IF_ERROR(AddQnnScalar<float>(qnn_model_wrapper, node_unit.Index(), node_unit.Name(), attr_value,
+                                      qnn_param_key, param_tensor_names));
+
+  return Ort::Status();
+}
+
+Ort::Status ProcessBlockSizeAttribute(QnnModelWrapper& qnn_model_wrapper,
+                                      const OrtNodeUnit& node_unit,
+                                      std::vector<std::string>& param_tensor_names) {
+  OrtNodeAttrHelper node_helper(node_unit);
+  uint32_t block_size = node_helper.Get("blocksize", static_cast<uint32_t>(0));
+  std::vector<uint32_t> block_size_shape{2};
+  std::vector<uint32_t> block_size_data(2, block_size);
+  QnnParamWrapper block_size_param(node_unit.Index(), node_unit.Name(), QNN_OP_DEPTH_TO_SPACE_PARAM_BLOCK_SIZE,
+                                   std::move(block_size_shape), std::move(block_size_data));
+  param_tensor_names.push_back(block_size_param.GetParamTensorName());
+  qnn_model_wrapper.AddParamWrapper(std::move(block_size_param));
+
+  return Ort::Status();
+}
+
+Ort::Status ProcessModeAttribute(QnnModelWrapper& qnn_model_wrapper,
+                                 const OrtNodeUnit& node_unit,
+                                 std::vector<std::string>& param_tensor_names) {
+  OrtNodeAttrHelper node_helper(node_unit);
+  std::string mode = node_helper.Get("mode", "DCR");
+  uint32_t mode_value = QNN_OP_DEPTH_TO_SPACE_MODE_DCR;
+  if ("DCR" == mode) {
+    mode_value = QNN_OP_DEPTH_TO_SPACE_MODE_DCR;
+  } else if ("CRD" == mode) {
+    mode_value = QNN_OP_DEPTH_TO_SPACE_MODE_CRD;  // CRD mode
+  } else {
+    return MAKE_EP_FAIL("DepthToSpace mode only support DCR & CRD.");
+  }
+
+  RETURN_IF_ERROR(AddQnnScalar<uint32_t>(qnn_model_wrapper, node_unit.Index(), node_unit.Name(), mode_value,
+                                         QNN_OP_DEPTH_TO_SPACE_PARAM_MODE, param_tensor_names));
+
+  return Ort::Status();
+}
+
+// Process alpha attribute as input for Qnn LeakyRelu
+Ort::Status ProcessAlphaAttributeAsInput(QnnModelWrapper& qnn_model_wrapper,
+                                         const OrtNodeUnit& node_unit,
+                                         const std::string input_name) {
+  OrtNodeAttrHelper node_helper(node_unit);
+  QnnQuantParamsWrapper quantize_param;
+  Qnn_DataType_t qnn_data_type = QNN_DATATYPE_FLOAT_32;
+  union {
+    float alpha;
+    uint16_t alpha_fp16;
+    uint8_t unpack[sizeof(float)];
+  } tensor_data;
+  tensor_data.alpha = node_helper.Get("alpha", 0.01f);
+  std::vector<uint8_t> unpacked_data;
+  // Check LeakyRelu input 0 to see if it's quantized tensor
+  bool is_quantized_tensor = node_unit.Outputs()[0].quant_param.has_value();
+  if (is_quantized_tensor) {
+    qnn_data_type = QNN_DATATYPE_UFIXED_POINT_8;
+    std::array<float, 1> scales = {1.0f};
+    std::array<int32_t, 1> offsets = {0};
+    std::array<uint32_t, 1> shape = {1};
+    auto float_data = gsl::make_span<const float>(&tensor_data.alpha, 1);
+    RETURN_IF_ERROR(qnn::utils::GetDataQuantParams(float_data, shape, scales, offsets, qnn_data_type));
+
+    unpacked_data.resize(1);
+    RETURN_IF_ERROR(qnn::utils::QuantizeData(float_data, shape, scales, offsets, unpacked_data, qnn_data_type));
+    quantize_param = QnnQuantParamsWrapper::PerTensor(scales[0], static_cast<int32_t>(offsets[0]));
+  } else {
+    const auto& inputs = node_unit.Inputs();
+    TensorInfo input_info = {};
+    RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(inputs[0], input_info));
+    // QNN requires alpha is fp16 when input is fp16
+    if (input_info.qnn_data_type == QNN_DATATYPE_FLOAT_16) {
+      tensor_data.alpha_fp16 = Ort::Float16_t(tensor_data.alpha).val;
+      qnn_data_type = QNN_DATATYPE_FLOAT_16;
+      unpacked_data.assign(tensor_data.unpack, tensor_data.unpack + sizeof(Ort::Float16_t));
+    } else {
+      unpacked_data.assign(tensor_data.unpack, tensor_data.unpack + sizeof(float));
+    }
+  }
+  std::vector<uint32_t> input_shape{1};
+  Qnn_TensorType_t tensor_type = QNN_TENSOR_TYPE_STATIC;
+  QnnTensorWrapper input_tensorwrapper(input_name, tensor_type, qnn_data_type, std::move(quantize_param),
+                                       std::move(input_shape), std::move(unpacked_data));
+  RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(input_tensorwrapper)), "Failed to add tensor.");
+  return Ort::Status();
+}
+
+Ort::Status ProcessGridSampleAttributes(QnnModelWrapper& qnn_model_wrapper,
+                                        const OrtNodeUnit& node_unit,
+                                        std::vector<std::string>& param_tensor_names) {
+  OrtNodeAttrHelper node_helper(node_unit);
+  int64_t align_corners = node_helper.Get("align_corners", static_cast<int64_t>(0));
+  RETURN_IF_ERROR(AddQnnScalar<bool>(qnn_model_wrapper, node_unit.Index(), node_unit.Name(), align_corners != 0,
+                                     QNN_OP_GRID_SAMPLE_PARAM_ALIGN_CORNERS, param_tensor_names));
+
+  std::string mode = node_helper.Get("mode", "linear");
+  uint32_t mode_value = QNN_OP_GRID_SAMPLE_MODE_BILINEAR;
+  if ("linear" == mode || "bilinear" == mode) {
+    mode_value = QNN_OP_GRID_SAMPLE_MODE_BILINEAR;
+  } else if ("nearest" == mode) {
+    mode_value = QNN_OP_GRID_SAMPLE_MODE_NEAREST;
+  } else {
+    return MAKE_EP_FAIL("GridSample mode only support [linear, bilinear, nearest].");
+  }
+  RETURN_IF_ERROR(AddQnnScalar<uint32_t>(qnn_model_wrapper, node_unit.Index(), node_unit.Name(), mode_value,
+                                         QNN_OP_GRID_SAMPLE_PARAM_MODE, param_tensor_names));
+
+  std::string padding_mode = node_helper.Get("padding_mode", "zeros");
+  uint32_t padding_mode_value = QNN_OP_GRID_SAMPLE_PADDING_MODE_ZEROS;
+  if ("zeros" == padding_mode) {
+    padding_mode_value = QNN_OP_GRID_SAMPLE_PADDING_MODE_ZEROS;
+  } else if ("border" == padding_mode) {
+    padding_mode_value = QNN_OP_GRID_SAMPLE_PADDING_MODE_BORDER;
+  } else if ("reflection" == padding_mode) {
+    padding_mode_value = QNN_OP_GRID_SAMPLE_PADDING_MODE_REFLECTION;
+  } else {
+    return MAKE_EP_FAIL("GridSample padding_mode only support [zeros, border, reflection].");
+  }
+  RETURN_IF_ERROR(AddQnnScalar<uint32_t>(qnn_model_wrapper, node_unit.Index(), node_unit.Name(), padding_mode_value,
+                                         QNN_OP_GRID_SAMPLE_PARAM_PADDING_MODE, param_tensor_names));
+
+  return Ort::Status();
+}
+
+// Left-folds a variadic ONNX Sum/Max/Min (>=2 inputs) into a chain of fine-grained QNN ops and builds
+// the final output node itself.
+// For quantized output: input->DQ->float32->Q->output
+//    The DQ process should've been added in ProcessInputs, written here to keep ProcessInputs clean
+// For non-quantized output: the fold happens in the output dtype
+Ort::Status ProcessVariadicToBinaryChain(QnnModelWrapper& qnn_model_wrapper,
+                                         const OrtNodeUnit& node_unit,
+                                         std::vector<std::string>& input_names,
+                                         const std::string& qnn_op_type,
+                                         bool do_op_validation) {
+  const auto& inputs = node_unit.Inputs();
+  const auto& output = node_unit.Outputs()[0];
+  TensorInfo output_info = {};
+  RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(output, output_info));
+
+  const size_t num_inputs = input_names.size();
+
+  const bool output_quantized = output.quant_param.has_value();
+
+  // Check if we need to add an output cast node for int64
+  const bool is_graph_output = qnn_model_wrapper.IsGraphOutput(output.name);
+  const bool needs_int64_cast =
+      !output_quantized && is_graph_output &&
+      (output_info.qnn_data_type == QNN_DATATYPE_INT_64 ||
+       output_info.qnn_data_type == QNN_DATATYPE_UINT_64);
+  const Qnn_DataType_t cast_dtype =
+      (output_info.qnn_data_type == QNN_DATATYPE_INT_64) ? QNN_DATATYPE_INT_32 : QNN_DATATYPE_UINT_32;
+
+  const Qnn_DataType_t intermediate_dtype =
+      output_quantized   ? QNN_DATATYPE_FLOAT_32
+      : needs_int64_cast ? cast_dtype
+                         : output_info.qnn_data_type;
+
+  auto add_tensor = [&qnn_model_wrapper](std::string name, Qnn_TensorType_t type, Qnn_DataType_t dtype,
+                                         QnnQuantParamsWrapper quant_param, std::vector<uint32_t> shape) {
+    QnnTensorWrapper wrapper(std::move(name), type, dtype, std::move(quant_param), std::move(shape));
+    return qnn_model_wrapper.AddTensorWrapper(std::move(wrapper));
+  };
+
+  auto add_binary = [&](const std::string& lhs, const std::string& rhs,
+                        const std::string& out_name) -> Ort::Status {
+    const std::string node_name = utils::UniqueNameGenerator().New(node_unit, qnn_op_type);
+    RETURN_IF_NOT(qnn_model_wrapper.CreateQnnNode(node_name, QNN_OP_PACKAGE_NAME_QTI_AISW,
+                                                  qnn_op_type, {lhs, rhs}, {out_name},
+                                                  {}, do_op_validation),
+                  "Failed to add binary node.");
+    return Ort::Status();
+  };
+
+  std::vector<std::vector<uint32_t>> shapes(num_inputs);
+  for (size_t i = 0; i < num_inputs; ++i) {
+    RETURN_IF_NOT(qnn_model_wrapper.GetOnnxShape(inputs[i].shape, shapes[i]), "Failed to get input shape.");
+  }
+
+  // Add DQ node for each quantized input, dequantized to float32 so the fold chain can run in float space.
+  for (size_t i = 0; i < num_inputs; ++i) {
+    if (!inputs[i].quant_param.has_value()) {
+      continue;
+    }
+    const std::string dq_name = input_names[i] + "_to_f32";
+    RETURN_IF_ERROR(qnn_model_wrapper.AddDequantizeNode(input_names[i], dq_name, QNN_DATATYPE_FLOAT_32,
+                                                        shapes[i], do_op_validation));
+    input_names[i] = dq_name;
+  }
+
+  // Fold all inputs into a chain of binary ops. Every binary node is created in this loop.
+  std::string lhs_name = input_names[0];
+  std::vector<uint32_t> running_shape = shapes[0];
+
+  for (size_t i = 1; i < num_inputs; ++i) {
+    std::vector<uint32_t> next;
+    RETURN_IF_ERROR(utils::BroadcastShape(running_shape, shapes[i], next));
+    running_shape = std::move(next);
+    const bool is_last = (i == num_inputs - 1);
+    std::string out_name;
+
+    if (!is_last || output_quantized || needs_int64_cast) {
+      out_name = utils::NodeUnitBaseName(node_unit) + "_fold_" + std::to_string(i);
+      RETURN_IF_NOT(add_tensor(out_name, QNN_TENSOR_TYPE_NATIVE, intermediate_dtype,
+                               QnnQuantParamsWrapper(), std::vector<uint32_t>(running_shape)),
+                    "AddTensorWrapper failed for fold output.");
+    } else {
+      // Last binary node writes directly to the graph output tensor. No need for further quantize or cast node.
+      const Qnn_TensorType_t output_tensor_type =
+          is_graph_output ? QNN_TENSOR_TYPE_APP_READ : QNN_TENSOR_TYPE_NATIVE;
+      out_name = output.name;
+
+      RETURN_IF_NOT(add_tensor(out_name, output_tensor_type, output_info.qnn_data_type,
+                               output_info.quant_param.Copy(), std::vector<uint32_t>(output_info.shape)),
+                    "AddTensorWrapper failed for output.");
+    }
+
+    RETURN_IF_ERROR(add_binary(lhs_name, input_names[i], out_name));
+    lhs_name = out_name;
+  }
+
+  // Add the Quantize/cast node after the last binary operate node that produces the actual output tensor.
+  if (output_quantized) {
+    const Qnn_TensorType_t out_type =
+        is_graph_output ? QNN_TENSOR_TYPE_APP_READ : QNN_TENSOR_TYPE_NATIVE;
+    RETURN_IF_ERROR(qnn_model_wrapper.AddQuantizeNode(lhs_name, output.name, out_type, output_info.qnn_data_type,
+                                                      output_info.quant_param.Copy(), output_info.shape,
+                                                      do_op_validation));
+  } else if (needs_int64_cast) {
+    RETURN_IF_ERROR(qnn_model_wrapper.AddCastNode(utils::UniqueNameGenerator().New(node_unit, "_cast_int64"),
+                                                  lhs_name, output.name, QNN_TENSOR_TYPE_APP_READ,
+                                                  output_info.qnn_data_type, output_info.quant_param.Copy(),
+                                                  std::vector<uint32_t>(output_info.shape), do_op_validation));
+  }
+
+  return Ort::Status();
+}
+
+Ort::Status SimpleOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_model_wrapper,
+                                                         const OrtNodeUnit& node_unit,
+                                                         std::vector<std::string>&& input_names,
+                                                         const Ort::Logger& logger,
+                                                         bool do_op_validation) const {
+  if (input_names.size() < 1) {
+    return Ort::Status();
+  }
+
+  const std::string& op_type = node_unit.OpType();
+
+  if (do_op_validation) {
+    RETURN_IF_ERROR(ExplicitOpCheck(qnn_model_wrapper, node_unit));
+    // Skip the op validation for DepthToSpace & SpaceToDepth if it's not NHWC data layout
+    if (node_unit.Domain() != kMSInternalNHWCDomain && (op_type == "DepthToSpace" || op_type == "SpaceToDepth" || op_type == "GridSample")) {
+      return Ort::Status();
+    }
+
+#if QNN_API_VERSION_MAJOR >= 2 && QNN_API_VERSION_MINOR >= 21 && QNN_API_VERSION_MINOR <= 23
+    // Skip QNN validation for Tanh with uint16 (quantized) output.
+    // This gets around a Tanh QNN validation bug in QNN SDK 2.28.0 - 2.30.0.
+    // The QNN documentation states that the output scale and offset for ufixed_point_16 should be
+    // (1/32768) and -32768, respectively. However, the QNN validator incorrectly rejects these values.
+    if (op_type == "Tanh") {
+      TensorInfo output_info = {};
+      RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(node_unit.Outputs()[0], output_info));
+      if (output_info.qnn_data_type == QNN_DATATYPE_UFIXED_POINT_16) {
+        ORT_CXX_LOG(logger,
+                    ORT_LOGGING_LEVEL_INFO,
+                    ("Skipping QNN validation for Tanh node '" + node_unit.Name() +
+                     "' with quantized unit16 output.")
+                        .c_str());
+        return Ort::Status();
+      }
+    }
+#endif
+  }
+
+  std::vector<std::string> param_tensor_names;
+  // Add attribute
+  if (op_type == "LpNormalization") {
+    int32_t axis = 0;
+    RETURN_IF_ERROR(GetCanonicalizedAxisAttribute(qnn_model_wrapper, node_unit, "axis", -1, axis));
+    RETURN_IF_ERROR(AddQnnScalar<uint32_t>(qnn_model_wrapper, node_unit.Index(), node_unit.Name(),
+                                           static_cast<uint32_t>(axis), QNN_OP_L2_NORM_PARAM_AXIS, param_tensor_names));
+
+    OrtNodeAttrHelper node_helper(node_unit);
+    int64_t norm_p_order = node_helper.Get("p", static_cast<int64_t>(2));
+    RETURN_IF(norm_p_order != 2, "QNN EP only supports LpNormalization with 'p' attribute equal to 2.");
+  }
+
+  if (op_type == "LeakyRelu") {
+    std::string input_name = utils::UniqueNameGenerator().New(node_unit.Name(), "_alpha");
+    RETURN_IF_ERROR(ProcessAlphaAttributeAsInput(qnn_model_wrapper, node_unit, input_name));
+    input_names.push_back(input_name);
+  }
+
+  if (op_type == "Elu") {
+    RETURN_IF_ERROR(ProcessNodeAttribute(qnn_model_wrapper, node_unit, "alpha",
+                                         QNN_OP_ELU_PARAM_ALPHA, param_tensor_names));
+  }
+
+  if (op_type == "Softplus") {
+    // ONNX Softplus has no attributes; set QNN defaults (beta=1, threshold=20).
+    RETURN_IF_ERROR(AddQnnScalar<float>(qnn_model_wrapper, node_unit.Index(), node_unit.Name(), 1.0f,
+                                        QNN_OP_ELEMENT_WISE_NEURON_PARAM_BETA, param_tensor_names));
+    RETURN_IF_ERROR(AddQnnScalar<float>(qnn_model_wrapper, node_unit.Index(), node_unit.Name(), 20.0f,
+                                        QNN_OP_ELEMENT_WISE_NEURON_PARAM_THRESHOLD, param_tensor_names));
+    RETURN_IF_ERROR(AddQnnScalar<uint32_t>(qnn_model_wrapper, node_unit.Index(), node_unit.Name(),
+                                           static_cast<uint32_t>(QNN_OP_ELEMENT_WISE_NEURON_OPERATION_SOFTPLUS),
+                                           QNN_OP_ELEMENT_WISE_NEURON_PARAM_OPERATION, param_tensor_names));
+  }
+
+  if (op_type == "HardSwish") {
+    AddHardSwishNeuronParams(qnn_model_wrapper, node_unit.Index(), node_unit.Name(), param_tensor_names);
+  }
+
+  if (op_type == "HardSigmoid") {
+    RETURN_IF_ERROR(ProcessNodeAttribute(qnn_model_wrapper, node_unit, "alpha",
+                                         QNN_OP_ELEMENT_WISE_NEURON_PARAM_ALPHA,
+                                         param_tensor_names, 0.2f));
+    RETURN_IF_ERROR(ProcessNodeAttribute(qnn_model_wrapper, node_unit, "beta",
+                                         QNN_OP_ELEMENT_WISE_NEURON_PARAM_BETA,
+                                         param_tensor_names, 0.5f));
+    RETURN_IF_ERROR(AddQnnScalar<uint32_t>(qnn_model_wrapper, node_unit.Index(), node_unit.Name(),
+                                           static_cast<uint32_t>(QNN_OP_ELEMENT_WISE_NEURON_OPERATION_HARD_SIGMOID),
+                                           QNN_OP_ELEMENT_WISE_NEURON_PARAM_OPERATION, param_tensor_names));
+  }
+
+  if (op_type == "DepthToSpace") {
+    RETURN_IF_ERROR(ProcessBlockSizeAttribute(qnn_model_wrapper, node_unit, param_tensor_names));
+    RETURN_IF_ERROR(ProcessModeAttribute(qnn_model_wrapper, node_unit, param_tensor_names));
+  }
+
+  if (op_type == "SpaceToDepth") {
+    RETURN_IF_ERROR(ProcessBlockSizeAttribute(qnn_model_wrapper, node_unit, param_tensor_names));
+    RETURN_IF_ERROR(AddQnnScalar<uint32_t>(qnn_model_wrapper, node_unit.Index(), node_unit.Name(),
+                                           static_cast<uint32_t>(QNN_OP_SPACE_TO_DEPTH_MODE_DCR),
+                                           QNN_OP_SPACE_TO_DEPTH_PARAM_MODE, param_tensor_names));
+  }
+
+  if (op_type == "GridSample") {
+    RETURN_IF_ERROR(ProcessGridSampleAttributes(qnn_model_wrapper, node_unit, param_tensor_names));
+  }
+
+  // Variadic Sum/Max/Min with > 2 inputs.  left-folded chain of fine-grained QNN ops. The helper does its
+  // own dequantize/fold/requantize and builds the output node itself, returns directly and
+  // bypasses the base ProcessOutputs.
+  // The 2-input case falls through to the ProcessOutputs path below (GetQnnOpType).
+  if ((op_type == "Sum" || op_type == "Max" || op_type == "Min") && input_names.size() > 2) {
+    return ProcessVariadicToBinaryChain(qnn_model_wrapper, node_unit, input_names,
+                                        GetQnnOpType(op_type), do_op_validation);
+  }
+
+  return ProcessOutputs(qnn_model_wrapper, node_unit,
+                        std::move(input_names),
+                        std::move(param_tensor_names),
+                        logger, do_op_validation, GetQnnOpType(op_type));
+}
+
+/**
+ * Overrides offset and scale quantization parameters for operators (e.g., Sigmoid or Tanh) that require
+ * specific values. Returns true if the quantization parameters were overridden.
+ *
+ * \param op_type The ONNX operator type.
+ * \param qnn_data_type The QNN tensor data type.
+ * \param quant_params Output scale/offset parameter that may be overridden.
+ * \return True if the offset and scale were overridden.
+ */
+static bool OverrideQuantParams(const std::string& op_type, Qnn_DataType_t qnn_data_type,
+                                Qnn_ScaleOffset_t& quant_params) {
+  const int32_t orig_offset = quant_params.offset;
+  const float orig_scale = quant_params.scale;
+
+  if (op_type == "Sigmoid" || op_type == "HardSigmoid") {
+    switch (qnn_data_type) {
+      case QNN_DATATYPE_UFIXED_POINT_16:
+        quant_params.offset = 0;
+        quant_params.scale = 1.0f / 65536.0f;
+        break;
+      case QNN_DATATYPE_SFIXED_POINT_16:
+        quant_params.offset = 0;
+        quant_params.scale = 1.0f / 32768.0f;
+        break;
+      default:
+        break;  // Do nothing.
+    }
+  }
+
+  if (op_type == "Tanh") {
+    switch (qnn_data_type) {
+      case QNN_DATATYPE_UFIXED_POINT_16:
+        quant_params.offset = -32768;
+        quant_params.scale = 1.0f / 32768.0f;
+        break;
+      case QNN_DATATYPE_SFIXED_POINT_16:
+        quant_params.offset = 0;
+        quant_params.scale = 1.0f / 32768.0f;
+        break;
+      default:
+        break;  // Do nothing.
+    }
+  }
+
+  return quant_params.offset != orig_offset || quant_params.scale != orig_scale;
+}
+
+Ort::Status SimpleOpBuilder::OverrideOutputQuantParam(QnnModelWrapper& qnn_model_wrapper,
+                                                      const OrtNodeUnit& node_unit,
+                                                      const Ort::Logger& logger,
+                                                      const std::vector<std::string>& input_names,
+                                                      size_t output_index,
+                                                      Qnn_DataType_t qnn_data_type,
+                                                      QnnQuantParamsWrapper& quant_param) const {
+  ORT_UNUSED_PARAMETER(input_names);
+  const std::string& op_type = node_unit.OpType();
+
+  // Override output quantization parameters for uint16 QDQ Sigmoid or Tanh.
+  // QNN requires 16-bit QDQ Sigmoid and Tanh to use specific output scale and zero-point values
+  // regardless of floating-point range.
+  if (op_type == "Sigmoid" || op_type == "Tanh" || op_type == "HardSigmoid") {
+    const auto& outputs = node_unit.Outputs();
+    RETURN_IF_NOT(output_index < outputs.size(),
+                  ("Invalid output index in OverrideOutputQuantParam for op " + op_type).c_str());
+
+    const auto& output = node_unit.Outputs()[0];
+    const std::string& output_name = output.name;
+
+    if (quant_param.IsPerTensor(/*include_bw*/ false)) {
+      if (OverrideQuantParams(op_type, qnn_data_type, quant_param.Get().scaleOffsetEncoding)) {
+        const int32_t offset = quant_param.Get().scaleOffsetEncoding.offset;
+        const float scale = quant_param.Get().scaleOffsetEncoding.scale;
+
+        std::ostringstream oss;
+        oss << "QNN requires that 16-bit quantized " << op_type
+            << " operators use offset/scale values "
+            << "of <" << offset << ", " << scale
+            << ">. QNN EP will override the original values for output " << output_name;
+        ORT_CXX_LOG(logger, ORT_LOGGING_LEVEL_VERBOSE, oss.str().c_str());
+        RETURN_IF(qnn_model_wrapper.IsQnnTensorWrapperExist(output_name),
+                  ("QNN EP is unable to override output quantization parameters for " + op_type +
+                   " operator. Node name: " + node_unit.Name() + ", output name: " + output_name)
+                      .c_str());
+      }
+    }
+  }
+
+  return Ort::Status();
+}
+
+void CreateSimpleOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations) {
+  op_registrations.AddOpBuilder(op_type, std::make_unique<SimpleOpBuilder>());
+}
+
+}  // namespace qnn
+}  // namespace onnxruntime

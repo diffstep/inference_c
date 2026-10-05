@@ -1,0 +1,482 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License
+
+#pragma once
+
+#include <cstring>
+#include <cstddef>
+#include <functional>
+#include <gsl/gsl>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+// This compilation unit (ort_api.h/.cc) encapsulates the interface between the EP and ORT in a manner
+// that allows QNN EP to built either as a static library or a dynamic shared library.
+// The preprocessor macro `BUILD_QNN_EP_STATIC_LIB` is defined and set to 1 if QNN EP
+// is built as a static library.
+// Includes when building QNN EP as a shared library
+// #include "core/providers/shared_library/provider_api.h"
+// ORT_UNIT_TEST_BUILD is defined when genie source files are recompiled directly
+// into the unit test binary. In that context, the test binary owns ORT API
+// initialization, so ORT_API_MANUAL_INIT must NOT be set (all TUs must agree).
+#ifndef ORT_UNIT_TEST_BUILD
+#define ORT_API_MANUAL_INIT
+#endif  // !ORT_UNIT_TEST_BUILD
+
+// Public headers from ORT Core
+#include "onnxruntime_c_api.h"
+#include "onnxruntime_cxx_api.h"
+
+// EPContext encryption callbacks were added at ORT API v28.
+#if ORT_API_VERSION >= 28
+#define ORT_API_HAS_EPCONTEXT_ENCRYPTION 1
+#else
+#define ORT_API_HAS_EPCONTEXT_ENCRYPTION 0
+#endif
+
+#if ORT_API_HAS_EPCONTEXT_ENCRYPTION
+#include "onnxruntime_experimental_c_api.h"
+#include "onnxruntime_experimental_cxx_api.h"
+#else
+// Forward-declare v28 typedefs so QNN EP signatures that mention them still compile
+// against pre-v28 ORT headers. Bodies gated on ORT_API_HAS_EPCONTEXT_ENCRYPTION supply
+// the real definitions; the pointers are only ever dereferenced on the v28+ path.
+extern "C" {
+struct OrtEpContextConfig;
+typedef struct OrtEpContextConfig OrtEpContextConfig;
+typedef OrtStatus*(ORT_API_CALL* OrtWriteNamedBufferFunc)(void* state, const char* name,
+                                                          const void* buffer, size_t buffer_num_bytes);
+typedef OrtStatus*(ORT_API_CALL* OrtReadNamedBufferFunc)(void* state, const char* name,
+                                                         OrtAllocator* allocator,
+                                                         void** buffer, size_t* data_size);
+}
+#endif  // ORT_API_HAS_EPCONTEXT_ENCRYPTION
+
+#include "onnxruntime_run_options_config_keys.h"
+#include "onnxruntime_session_options_config_keys.h"
+
+#include "core/providers/qnn/common/int2.h"
+#include "core/providers/qnn/common/int4.h"
+#include "core/providers/qnn/common/qnn_safeint.h"
+
+namespace onnxruntime {
+
+// True for any ARM64 target: native ARM64 (Windows/Linux) AND the ARM64EC half of a
+// Windows arm64x fat binary. ARM64EC must be included because an amd64 process on an
+// arm64 device executes the ARM64EC half of an arm64x module, which defines _M_ARM64EC
+// (not _M_ARM64). Omitting it makes on-device code misdetect itself as an x86 host.
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
+#define QNN_ARCH_ARM64 1
+#else
+#define QNN_ARCH_ARM64 0
+#endif
+
+#define MAKE_FAIL(msg) Ort::Status(msg, ORT_FAIL)
+#define MAKE_EP_FAIL(msg) Ort::Status(msg, ORT_EP_FAIL)
+
+#if ORT_API_VERSION >= 25
+#define QNN_ORT_EP_PROFILING_API_ENABLED 1
+#else
+#define QNN_ORT_EP_PROFILING_API_ENABLED 0
+#endif
+
+// ORT_DEVICE_RESET (added in ORT 1.28 / API 28) lets callers distinguish an unrecoverable
+// SSR from other EP errors; fall back to ORT_ENGINE_ERROR for older prebuilt ORT headers.
+#if ORT_API_VERSION >= 28
+#define QNN_SSR_UNRECOVERABLE_ERROR_CODE ORT_DEVICE_RESET
+#else
+#define QNN_SSR_UNRECOVERABLE_ERROR_CODE ORT_ENGINE_ERROR
+#endif
+
+#define RETURN_IF(cond, msg)      \
+  do {                            \
+    if ((cond)) {                 \
+      return MAKE_EP_FAIL((msg)); \
+    }                             \
+  } while (0)
+
+#define RETURN_IF_NOT(cond, msg) \
+  RETURN_IF(!(cond), msg)
+
+#define RETURN_IF_ERROR(fn)     \
+  do {                          \
+    Ort::Status _status = (fn); \
+    if (!_status.IsOK()) {      \
+      return _status;           \
+    }                           \
+  } while (0)
+
+#define RETURN_IF_NOT_OK(fn)    \
+  do {                          \
+    Ort::Status _status = (fn); \
+    if (!_status.IsOK()) {      \
+      return _status.release(); \
+    }                           \
+  } while (0)
+
+#define RETURN_IF_NOT_NULL(fn) \
+  do {                         \
+    OrtStatus* _status = (fn); \
+    if (_status != nullptr) {  \
+      return _status;          \
+    }                          \
+  } while (0)
+
+#define RETURN_DEFAULT_IF_API_FAIL(ort_api_fn_call, ort_api, ret_val) \
+  do {                                                                \
+    if (OrtStatus* _status = (ort_api_fn_call)) {                     \
+      (ort_api).ReleaseStatus(_status);                               \
+      return (ret_val);                                               \
+    }                                                                 \
+  } while (0)
+
+#define ORT_RETURN_FALSE_ON_ERROR(ort_api_fn_call, ort_api) \
+  RETURN_DEFAULT_IF_API_FAIL((ort_api_fn_call), (ort_api), false)
+
+#define ORT_RETURN_NULLPTR_ON_ERROR(ort_api_fn_call, ort_api) \
+  RETURN_DEFAULT_IF_API_FAIL((ort_api_fn_call), (ort_api), nullptr)
+
+#define ORT_CONTINUE_ON_ERROR(ort_api_fn_call, ort_api) \
+  do {                                                  \
+    if (OrtStatus* _status = (ort_api_fn_call)) {       \
+      (ort_api).ReleaseStatus(_status);                 \
+      continue;                                         \
+    }                                                   \
+  } while (0)
+
+#define LOG_AND_THROW_ERROR(logger, msg)                   \
+  do {                                                     \
+    ORT_CXX_LOG((logger), ORT_LOGGING_LEVEL_ERROR, (msg)); \
+    throw std::runtime_error((msg));                       \
+  } while (0)
+
+// Ort::Logger must be standard-layout so that its first declared member (logger_) is
+// guaranteed to reside at offset 0 with no vtable or padding before it. If this assert
+// fires, ORT changed the class layout and IsNullLogger's memcpy approach must be revised.
+static_assert(std::is_standard_layout<Ort::Logger>::value,
+              "IsNullLogger requires Ort::Logger to be standard-layout");
+
+// Returns true if an Ort::Logger has a null internal OrtLogger pointer (i.e., was default-constructed
+// and never initialized). Ort::Logger is standard-layout; its first member
+// (const OrtLogger* logger_) is at offset 0, so memcpy is well-defined here.
+inline bool IsNullLogger(const Ort::Logger& logger) {
+  const OrtLogger* ptr = nullptr;
+  std::memcpy(&ptr, &logger, sizeof(ptr));
+  return ptr == nullptr;
+}
+
+// Convenient macro for logging with an Ort::Logger pointer, especially in QnnBackendManager.
+// This macro avoids the necessity of parentheses (i.e., (*logger_ptr)) in every ORT_CXX_LOG call.
+// Guards against a null-constructed Ort::Logger (no-op when logger is uninitialized).
+// This macro can be removed once ORT_CXX_LOG is fixed to properly wrap given logger with parentheses.
+#define ORT_CXX_LOG_PTR(logger_ptr, message_severity, message) \
+  do {                                                         \
+    if ((logger_ptr) && !IsNullLogger(*logger_ptr)) {          \
+      ORT_CXX_LOG((*logger_ptr), message_severity, message);   \
+    }                                                          \
+  } while (false)
+
+// QNN-EP COPY START
+// Below are macors copied from core/common/common.h directly.
+#ifdef _WIN32
+#define ORT_UNUSED_PARAMETER(x) (x)
+#else
+#define ORT_UNUSED_PARAMETER(x) (void)(x)
+#endif
+
+#define ORT_IGNORE_RETURN_VALUE(x) (void)(x)
+
+// Macros to disable the copy and/or move ctor and assignment methods
+// These are usually placed in the private: declarations for a class.
+#define ORT_DISALLOW_COPY(TypeName) TypeName(const TypeName&) = delete
+
+#define ORT_DISALLOW_ASSIGNMENT(TypeName) TypeName& operator=(const TypeName&) = delete
+
+#define ORT_DISALLOW_COPY_AND_ASSIGNMENT(TypeName) \
+  ORT_DISALLOW_COPY(TypeName);                     \
+  ORT_DISALLOW_ASSIGNMENT(TypeName)
+
+#define ORT_DISALLOW_MOVE(TypeName) \
+  TypeName(TypeName&&) = delete;    \
+  TypeName& operator=(TypeName&&) = delete
+
+#define ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(TypeName) \
+  ORT_DISALLOW_COPY_AND_ASSIGNMENT(TypeName);           \
+  ORT_DISALLOW_MOVE(TypeName)
+// QNN-EP COPY END
+
+// Since ORT_TSTR expands to wstring and string on WIN32 and non-WIN32, respectively, this macro provides convenient
+// usage to convert std::filesystem::path accordingly.
+#ifdef _WIN32
+#define FILEPATH_TO_STRING(filepath) (filepath).wstring();
+#else
+#define FILEPATH_TO_STRING(filepath) (filepath).string();
+#endif
+
+class OrtLoggingManager {
+ public:
+  static const Ort::Logger& GetDefaultLogger() {
+    return GetLoggerInstance();
+  }
+
+  static const OrtLogger* GetDefaultLoggerPtr() {
+    return GetLoggerPtr();
+  }
+
+  static bool HasDefaultLogger() {
+    return GetLoggerPtr() != nullptr;
+  }
+
+  static void SetDefaultLogger(const OrtLogger* default_logger) {
+    GetLoggerPtr() = default_logger;
+  }
+
+ private:
+  OrtLoggingManager() = delete;
+
+  static const OrtLogger*& GetLoggerPtr() {
+    static const OrtLogger* default_logger_ = nullptr;
+    return default_logger_;
+  }
+
+  static const Ort::Logger& GetLoggerInstance() {
+    static const Ort::Logger ort_logger_ = Ort::Logger(GetLoggerPtr());
+    return ort_logger_;
+  }
+};
+
+struct ApiPtrs {
+  const OrtApi& ort_api;
+  const OrtEpApi& ep_api;
+  const OrtModelEditorApi& model_editor_api;
+};
+
+// Helper to release Ort one or more objects obtained from the public C API at the end of their scope.
+template <typename T>
+struct DeferOrtRelease {
+  DeferOrtRelease(T** object_ptr, std::function<void(T*)> release_func)
+      : objects_(object_ptr), count_(1), release_func_(release_func) {}
+
+  DeferOrtRelease(T** objects, size_t count, std::function<void(T*)> release_func)
+      : objects_(objects), count_(count), release_func_(release_func) {}
+
+  ~DeferOrtRelease() {
+    if (objects_ != nullptr && count_ > 0) {
+      for (size_t i = 0; i < count_; ++i) {
+        if (objects_[i] != nullptr) {
+          release_func_(objects_[i]);
+          objects_[i] = nullptr;
+        }
+      }
+    }
+  }
+  T** objects_ = nullptr;
+  size_t count_ = 0;
+  std::function<void(T*)> release_func_ = nullptr;
+};
+
+template <typename T>
+struct FuncDeleter {
+  using DeleteFunc = void (*)(T*);
+  DeleteFunc delete_func_;
+
+  void operator()(T* ptr) const noexcept {
+    if (ptr) delete_func_(ptr);
+  }
+};
+
+namespace QDQ {
+
+// Define NodeGroup structure similar to the one in shared/utils.h
+struct OrtNodeGroup {
+  std::vector<const OrtNode*> dq_nodes;
+  std::vector<const OrtNode*> q_nodes;
+  const OrtNode* target_node;
+  const OrtNode* redundant_clip_node{nullptr};
+  // MatMulAddFusion sandwiches a rank-2 Gemm between a pre-Reshape (rank-N -> rank-2 in front of
+  // DQ_act) and a post-Reshape (rank-2 -> rank-N behind Gemm's output). When the terminal Q sits on
+  // the far side of the post-Reshape, absorb the Reshape so the group's output IODef inherits Q's
+  // encoding; the op builder then emits FC (rank-2, encoded) + Reshape (rank-N, encoded).
+  const OrtNode* output_reshape_node{nullptr};
+};
+
+}  // namespace QDQ
+
+struct OrtNodeUnitIODef {
+  struct QuantParam {
+    const OrtValueInfo* scale;
+    const OrtValueInfo* zero_point{nullptr};
+    std::optional<int64_t> axis{std::nullopt};
+    std::optional<int64_t> block_size{std::nullopt};
+  };
+
+  std::string name;
+  ONNXTensorElementDataType type;
+  std::optional<std::vector<int64_t>> shape;
+  std::optional<QuantParam> quant_param;
+
+  bool Exists() const noexcept { return !name.empty(); }
+};
+
+class OrtNodeUnit {
+ public:
+  // NodeUnit type
+  enum class Type : uint8_t {
+    SingleNode,  // The NodeUnit contains a single node
+    QDQGroup,    // The NodeUnit contain a QDQ group of nodes, such as "DQ->Sigmoid->Q"
+  };
+
+ public:
+  explicit OrtNodeUnit(const OrtNode* node, const OrtApi& ort_api);
+  explicit OrtNodeUnit(const OrtGraph* graph, const QDQ::OrtNodeGroup& node_group, const OrtApi& ort_api);
+
+  Type UnitType() const noexcept { return type_; }
+
+  const std::vector<OrtNodeUnitIODef>& Inputs() const noexcept { return inputs_; }
+  const std::vector<OrtNodeUnitIODef>& Outputs() const noexcept { return outputs_; }
+
+  std::string Domain() const noexcept { return Ort::ConstNode(target_node_).GetDomain(); }
+  std::string OpType() const noexcept { return Ort::ConstNode(target_node_).GetOperatorType(); }
+  std::string Name() const noexcept { return Ort::ConstNode(target_node_).GetName(); }
+  int SinceVersion() const noexcept { return Ort::ConstNode(target_node_).GetSinceVersion(); }
+  // Align NodeUnit to name as Index although returning Id since index is inaccessible.
+  size_t Index() const noexcept { return Ort::ConstNode(target_node_).GetId(); }
+
+  const OrtNode& GetNode() const noexcept { return *target_node_; }
+  const OrtNode* GetRedundantClipNode() const noexcept { return redundant_clip_node_; }
+  const OrtNode* GetOutputReshapeNode() const noexcept { return output_reshape_node_; }
+  const std::vector<const OrtNode*>& GetDQNodes() const noexcept { return dq_nodes_; }
+  const std::vector<const OrtNode*>& GetQNodes() const noexcept { return q_nodes_; }
+  std::vector<const OrtNode*> GetAllNodesInGroup() const noexcept {
+    std::vector<const OrtNode*> all_nodes = dq_nodes_;
+    all_nodes.push_back(target_node_);
+    if (output_reshape_node_) {
+      all_nodes.push_back(output_reshape_node_);
+    }
+    if (redundant_clip_node_) {
+      all_nodes.push_back(redundant_clip_node_);
+    }
+    all_nodes.reserve(all_nodes.size() + q_nodes_.size());
+    for (auto& n : q_nodes_)
+      all_nodes.push_back(n);
+    return all_nodes;
+  }
+
+  size_t GetInputEdgesCount(const OrtApi& ort_api) const;
+  std::vector<const OrtNode*> GetOutputNodes(const OrtApi& ort_api) const;
+
+ private:
+  // // Initialization for a NodeUnit that contains a single node
+  OrtStatus* InitForSingleNode(const OrtApi& ort_api);
+
+  const std::vector<const OrtNode*> dq_nodes_;  // dq nodes for this NodeUnit, not necessarily all inputs
+  const OrtNode* target_node_;
+  const OrtNode* redundant_clip_node_ = nullptr;  // Optional redundant clip node for the QDQ group, nullptr if not present.
+  const OrtNode* output_reshape_node_ = nullptr;  // Optional post-Gemm Reshape absorbed by MatMulAddFusion, nullptr if not present.
+  const std::vector<const OrtNode*> q_nodes_;     // q-nodes for this NodeUnit. not necessarily all outputs
+  const Type type_;
+
+  std::vector<OrtNodeUnitIODef> inputs_;
+  std::vector<OrtNodeUnitIODef> outputs_;
+};
+
+/**
+ * Wrapping onnxruntime::Node for retrieving attribute values
+ */
+
+class OrtNodeAttrHelper {
+ public:
+  explicit OrtNodeAttrHelper(const OrtNode& node);
+
+  // Get the attributes from the target node of the node_unit
+  explicit OrtNodeAttrHelper(const OrtNodeUnit& node_unit);
+
+  /*
+   * Get with default
+   */
+  float Get(const std::string& key, float def_val) const;
+  std::vector<float> Get(const std::string& key, const std::vector<float>& def_val) const;
+
+  int64_t Get(const std::string& key, int64_t def_val) const;
+  std::vector<int64_t> Get(const std::string& key, const std::vector<int64_t>& def_val) const;
+
+  std::string Get(const std::string& key, std::string def_val) const;
+  std::vector<std::string> Get(const std::string& key, const std::vector<std::string>& def_val) const;
+
+  // Convert the i() or ints() of the attribute from int64_t to int32_t
+  int32_t Get(const std::string& key, int32_t def_val) const;
+  std::vector<int32_t> Get(const std::string& key, const std::vector<int32_t>& def_val) const;
+
+  // Convert the i() or ints() of the attribute from int64_t to uint32_t
+  uint32_t Get(const std::string& key, uint32_t def_val) const;
+  std::vector<uint32_t> Get(const std::string& key, const std::vector<uint32_t>& def_val) const;
+
+  /*
+   * Get without default.
+   */
+  std::optional<float> GetFloat(const std::string& key) const;
+  std::optional<std::vector<float>> GetFloats(const std::string& key) const;
+
+  std::optional<int64_t> GetInt64(const std::string& key) const;
+  std::optional<std::vector<int64_t>> GetInt64s(const std::string& key) const;
+
+  std::optional<std::string> GetString(const std::string& key) const;
+
+  bool HasAttr(const std::string& key) const;
+
+ private:
+  const OrtNode& node_;
+};
+
+OrtStatus* GetSessionConfigEntryOrDefault(const OrtApi& ort_api,
+                                          const OrtSessionOptions& session_options,
+                                          const std::string& config_key,
+                                          const std::string& default_val,
+                                          /*out*/ std::string& config_val);
+
+std::basic_string<ORTCHAR_T> GetModelPathString(const OrtGraph* graph, const OrtApi& ort_api);
+
+/**
+ * Returns a lowercase version of the input string.
+ * /param str The string to lowercase.
+ * /return The lowercased string.
+ */
+inline std::string GetLowercaseString(std::string str) {
+  // https://en.cppreference.com/w/cpp/string/byte/tolower
+  // The behavior of tolower from <cctype> is undefined if the argument is neither representable as unsigned char
+  // nor equal to EOF. To use tolower safely with a plain char (or signed char), the argument must be converted to
+  // unsigned char.
+  std::transform(str.begin(), str.end(), str.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return str;
+}
+
+// Refer to OrtSessionOptions::GetProviderOptionPrefix.
+std::string GetProviderOptionPrefix(const std::string& provider_name);
+
+/// @brief Gets the path of directory containing the dynamic library that contains the address.
+/// @param address An address of a function or variable in the dynamic library.
+/// @return The path of the directory containing the dynamic library, or an empty string if the path cannot be determined.
+std::basic_string<ORTCHAR_T> GetDynamicLibraryLocationByAddress(const void* address);
+
+// QNN-EP COPY START
+// Below implementations are directly copied from "core/platform/posix/env.cc" and "core/platform/windows/env.cc"
+// with few modifications to eliminate additional dependencies.
+std::basic_string<ORTCHAR_T> OrtGetRuntimePath();
+
+Ort::Status OrtLoadDynamicLibrary(const std::basic_string<ORTCHAR_T>& wlibrary_filename,
+                                  bool global_symbols,
+                                  void** handle);
+
+Ort::Status OrtUnloadDynamicLibrary(void* handle);
+
+Ort::Status OrtGetSymbolFromLibrary(void* handle, const std::string& symbol_name, void** symbol);
+
+Ort::Status ReadFileIntoBuffer(const ORTCHAR_T* file_path, int64_t offset, size_t length, gsl::span<char> buffer);
+// QNN-EP COPY END
+
+}  // namespace onnxruntime

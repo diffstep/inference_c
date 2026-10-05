@@ -1,0 +1,150 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#if !defined(ORT_MINIMAL_BUILD)
+
+#include <string>
+
+#include "test/providers/qnn/qnn_test_utils.h"
+#include "test/unittest_util/qdq_test_utils.h"
+
+#include "gtest/gtest.h"
+
+namespace onnxruntime {
+namespace test {
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
+
+// Function that builds a float32 model with a Where operator.
+GetTestModelFn BuildWhereTestCase(const TestInputDef<bool>& condition_def,
+                                  const TestInputDef<float>& x_def,
+                                  const TestInputDef<float>& y_def) {
+  return [condition_def, x_def, y_def](ModelTestBuilder& builder) {
+    MakeTestInput<bool>(builder, "condition", condition_def);
+    MakeTestInput<float>(builder, "x", x_def);
+    MakeTestInput<float>(builder, "y", y_def);
+
+    builder.MakeOutput("Y");
+
+    builder.AddNode("Where",
+                    "Where",
+                    {"condition", "x", "y"},
+                    {"Y"},
+                    kOnnxDomain);
+  };
+}
+
+// Function that builds a QDQ model with a Where operator.
+template <typename QuantType>
+static GetTestQDQModelFn<QuantType> BuildQDQWhereTestCase(const TestInputDef<bool>& condition_def,
+                                                          const TestInputDef<float>& x_def,
+                                                          const TestInputDef<float>& y_def) {
+  return [condition_def, x_def, y_def](ModelTestBuilder& builder,
+                                       std::vector<QuantParams<QuantType>>& output_qparams) {
+    // condition
+    MakeTestInput<bool>(builder, "condition", condition_def);
+
+    // x => Q => DQ => x_qdq
+    MakeTestInput<float>(builder, "x", x_def);
+    const QuantParams<QuantType> x_qparams = GetTestInputQuantParams<QuantType>(x_def);
+    const std::string x_qdq =
+        AddQDQNodePair<QuantType>(builder, "qdq_x", "x", x_qparams.scale, x_qparams.zero_point);
+
+    // y => Q => DQ => y_qdq
+    MakeTestInput<float>(builder, "y", y_def);
+    const QuantParams<QuantType> y_qparams = GetTestInputQuantParams<QuantType>(y_def);
+    const std::string y_qdq =
+        AddQDQNodePair<QuantType>(builder, "qdq_y", "y", y_qparams.scale, y_qparams.zero_point);
+
+    // Where operator.
+    builder.AddNode("Where",
+                    "Where",
+                    {"condition", x_qdq, y_qdq},
+                    {"Y"},
+                    kOnnxDomain);
+
+    // Output QDQ as graph output first (to match existing test harness expectations for output ordering).
+    AddQDQNodePairWithOutputAsGraphOutput<QuantType>(builder,
+                                                     "qdq_out",
+                                                     "Y",
+                                                     output_qparams[0].scale,
+                                                     output_qparams[0].zero_point);
+  };
+}
+
+/**
+ * Runs an Where model on the QNN HTP backend. Checks the graph node assignment, and that inference
+ * outputs for QNN and CPU match.
+ *
+ * \param condition_def The condition input's definition (shape, is_initializer, data).
+ * \param x_def The x input's definition.
+ * \param y_def The y input's definition.
+ * \param expected_ep_assignment How many nodes are expected to be assigned to QNN (All, Some, or None).
+ */
+template <typename QuantType = uint8_t>
+static void RunWhereQDQTest(const TestInputDef<bool>& condition_def,
+                            const TestInputDef<float>& x_def,
+                            const TestInputDef<float>& y_def,
+                            ExpectedEPNodeAssignment expected_ep_assignment) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+
+  // Runs model with DQ-> Where -> Q and compares the outputs of the CPU and QNN EPs.
+  TestQDQModelAccuracy(BuildWhereTestCase(condition_def, x_def, y_def),
+                       BuildQDQWhereTestCase<QuantType>(condition_def, x_def, y_def),
+                       provider_options,
+                       18,
+                       expected_ep_assignment);
+}
+
+// Check that QNN compiles DQ -> Where -> Q as a single unit.
+// Fails since QNN 2.37.1: Failed to finalize QNN graph. Error code: 1002
+TEST_F(QnnHTPBackendTests, WhereQDQU8) {
+  RunWhereQDQTest(TestInputDef<bool>({4, 3, 2}, false,
+                                     {true, false, true, false, true, false,
+                                      true, false, true, false, true, false,
+                                      true, false, true, false, true, false,
+                                      true, false, true, false, true, false}),
+                  TestInputDef<float>({4, 3, 2}, true, 0.0f, 2.0f),
+                  TestInputDef<float>({4, 3, 2}, true, 2.0f, 3.0),
+                  ExpectedEPNodeAssignment::All);
+}
+
+// Check that QNN compiles DQ -> Where -> Q as a single unit.
+// Check QNN Where works with broadcast
+TEST_F(QnnHTPBackendTests, WhereBroadcastU8) {
+  RunWhereQDQTest(TestInputDef<bool>({2}, false, {true, false}),
+                  TestInputDef<float>({4, 3, 2}, true, -2.0f, 2.0f),
+                  TestInputDef<float>({1}, true, {3.0f}),
+                  ExpectedEPNodeAssignment::All);
+}
+
+// Check that QNN compiles DQ -> Where -> Q as a single unit.
+TEST_F(QnnHTPBackendTests, WhereLargeDataU8) {
+  RunWhereQDQTest(TestInputDef<bool>({256}, false, false, true),
+                  TestInputDef<float>({1, 8, 16, 256}, true, -5000.0f, 0.0f),
+                  TestInputDef<float>({1, 8, 16, 256}, true, 0.0f, 5000.0f),
+                  ExpectedEPNodeAssignment::All);
+}
+
+// Check that QNN compiles DQ -> Where -> Q as a single unit.
+TEST_F(QnnHTPBackendTests, WhereLargeDataBroadcastU8) {
+  RunWhereQDQTest(TestInputDef<bool>({256}, false, false, true),
+                  TestInputDef<float>({1, 8, 16, 256}, true, 0.0f, 1.0f),
+                  TestInputDef<float>({1}, true, {3.0f}),
+                  ExpectedEPNodeAssignment::All);
+}
+
+TEST_F(QnnHTPBackendTests, WhereLargeDataBroadcastTransformedU8) {
+  RunWhereQDQTest(TestInputDef<bool>({1, 1, 256, 1}, false, false, true),
+                  TestInputDef<float>({1, 16, 256, 8}, true, 0.0f, 1.0f),
+                  TestInputDef<float>({1, 1, 1, 1}, true, {3.0f}),
+                  ExpectedEPNodeAssignment::All);
+}
+
+#endif  // defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
+
+}  // namespace test
+}  // namespace onnxruntime
+
+#endif

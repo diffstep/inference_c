@@ -1,0 +1,254 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: MIT
+
+name: Qualcomm Internal Build & Test
+
+permissions:
+  contents: read
+  checks: write
+
+on:
+  workflow_call:
+    inputs:
+      do_all:
+        type: boolean
+        default: true
+      do_windows_arm64:
+        type: boolean
+        default: false
+      # If true, build with NIGHTLY_BUILD=1, etc. to enable --nightly_build
+      nightly_build:
+        type: boolean
+        default: true
+      # Cross-compiling from X64 to ARM64 is faster with our runners, but cannot produce a wheel.
+      windows_arm64_runner_arch:
+        type: string
+        default: X64
+      target_py_vsn:
+        default: "3.12"
+        type: string
+
+env:
+  ORT_NIGHTLY_BUILD: "${{ inputs.nightly_build == true && '1' || '0' }}"
+  BUILD_ARTIFACTORY_REPO: "${{ secrets.BUILD_ARTIFACTORY_REPO }}"
+
+jobs:
+
+  archive-testdata:
+    uses: ./.github/workflows/qualcomm-internal-archive-testdata.yml
+    secrets: inherit
+
+  # Single change-detection gate (DRY): computes whether the diff touches code that needs a
+  # real build/test. Downstream required jobs consume this via the `has_code_changes` input and stay
+  # green even when it's false (they cannot be job-skipped without blocking the PR); non-required
+  # jobs gate at the job level. Mirrors the git-diff idiom already used by coverage.yml/asan.yml.
+  path-filter:
+    name: path-filter
+    runs-on: ["self-hosted", "X64", "Linux", "Build"]
+    outputs:
+      code: ${{ steps.gate.outputs.code }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          # No submodules: the gate only needs git history, not the working tree.
+      - name: Detect changed paths
+        id: gate
+        run: |
+          set -euo pipefail
+
+          # Non-PR events (push to main/rel-*, merge_group, workflow_dispatch) always do a full
+          # build. merge_group has no usable base_ref, so short-circuit before the diff.
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          base_ref="${{ github.base_ref }}"
+          if [ -z "${base_ref}" ]; then
+            echo "::error::github.base_ref is empty (event_name=${{ github.event_name }})"
+            exit 1
+          fi
+
+          if ! changed=$(git diff --name-only "origin/${base_ref}...HEAD"); then
+            echo "::error::git diff against origin/${base_ref}...HEAD failed"
+            exit 1
+          fi
+
+          # Build needed when any changed path is code-bearing. We invert a small docs-only
+          # allowlist: if any changed path is NOT docs (grep -qv), do a full build. This fails
+          # safe toward building (unknown/new paths build) and means CI workflow edits, qcom/
+          # scripts, cmake, sources, etc. all trigger a build without an explicit per-dir list.
+          if echo "${changed}" | grep -qvE \
+              -e '^docs/' \
+              -e '^[^/]+\.md$' \
+              -e '^LICENSE$'; then
+            echo "code=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "code=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+  build-linux-aarch64-oe-gcc11_2:
+    if: ${{ inputs.do_all }}
+    needs: [archive-testdata, path-filter]
+    uses: ./.github/workflows/qualcomm-internal-build-and-test-single-os.yml
+    secrets: inherit
+    with:
+      has_code_changes: ${{ needs['path-filter'].outputs.code == 'true' }}
+      nightly_build: ${{ inputs.nightly_build }}
+      target_os: linux
+      target_arch: aarch64_oe_gcc11_2
+      testdata_archive_artifact_name: testdata-tarbz2
+      target_py_vsn: None
+      upload_test_archive: true
+      upload_wheel: false
+      run_tests: false
+
+  test-linux-aarch64-oe-gcc11_2:
+    if: ${{ inputs.do_all }}
+    needs: [build-linux-aarch64-oe-gcc11_2, path-filter]
+    uses: ./.github/workflows/qualcomm-internal-qdc-test.yml
+    secrets: inherit
+    with:
+      has_code_changes: ${{ needs['path-filter'].outputs.code == 'true' }}
+      target_os: linux
+      target_arch: aarch64_oe_gcc11_2
+      testdata_archive_artifact_name: testdata-tarbz2
+
+  build-and-test-linux-x86_64-ubuntu-22-04:
+    if: ${{ inputs.do_all }}
+    needs: [archive-testdata, path-filter]
+    uses: ./.github/workflows/qualcomm-internal-build-and-test-single-os.yml
+    secrets: inherit
+    with:
+      has_code_changes: ${{ needs['path-filter'].outputs.code == 'true' }}
+      nightly_build: ${{ inputs.nightly_build }}
+      target_os: linux
+      target_arch: x86_64_ubuntu_22_04
+      testdata_archive_artifact_name: testdata-tarbz2
+      target_py_vsn: ${{ inputs.target_py_vsn }}
+      run_tests: true
+      test_wheel: false
+      upload_test_archive: true
+      upload_wheel: true
+
+  build-and-test-linux-arm64:
+    if: ${{ inputs.do_all }}
+    needs: [archive-testdata, path-filter]
+    uses: ./.github/workflows/qualcomm-internal-build-and-test-single-os.yml
+    secrets: inherit
+    with:
+      has_code_changes: ${{ needs['path-filter'].outputs.code == 'true' }}
+      nightly_build: ${{ inputs.nightly_build }}
+      target_os: linux
+      target_arch: aarch64_manylinux_2_34
+      testdata_archive_artifact_name: testdata-tarbz2
+      target_py_vsn: ${{ inputs.target_py_vsn }}
+      upload_test_archive: true
+      upload_wheel: true
+      test_wheel: false
+      run_tests: true
+      build_test_same_runner: false
+      test_runner_arch: arm64
+
+  build-and-test-windows-arm64:
+    if: ${{ inputs.do_all || inputs.do_windows_arm64 }}
+    needs: [archive-testdata, path-filter]
+    uses: ./.github/workflows/qualcomm-internal-build-and-test-single-os.yml
+    secrets: inherit
+    with:
+      has_code_changes: ${{ needs['path-filter'].outputs.code == 'true' }}
+      target_arch: arm64
+      testdata_archive_artifact_name: testdata-zip
+      build_runner_arch: ${{ inputs.windows_arm64_runner_arch }}
+      test_runner_arch: arm64
+      upload_wheel: ${{ inputs.windows_arm64_runner_arch == 'ARM64' && inputs.target_py_vsn }}
+      upload_test_archive: ${{ inputs.windows_arm64_runner_arch != 'ARM64' }}
+      build_test_same_runner: ${{ inputs.windows_arm64_runner_arch == 'ARM64' }}
+      target_py_vsn: ${{ inputs.windows_arm64_runner_arch == 'ARM64' && inputs.target_py_vsn || 'None' }}
+      nightly_build: ${{ inputs.nightly_build }}
+
+  build-and-test-windows-arm64ec:
+    if: ${{ inputs.do_all }}
+    needs: [archive-testdata, path-filter]
+    uses: ./.github/workflows/qualcomm-internal-build-and-test-single-os.yml
+    secrets: inherit
+    with:
+      has_code_changes: ${{ needs['path-filter'].outputs.code == 'true' }}
+      nightly_build: ${{ inputs.nightly_build }}
+      target_arch: arm64ec
+      testdata_archive_artifact_name: testdata-zip
+      upload_wheel: true
+      test_wheel: true
+      target_py_vsn: ${{ inputs.target_py_vsn }}
+      run_tests: false  # ARM64ec unit tests are horribly broken (though model tests seem fine).
+      test_runner_arch: arm64
+
+  build-and-test-windows-x86_64:
+    if: ${{ inputs.do_all }}
+    needs: [archive-testdata, path-filter]
+    uses: ./.github/workflows/qualcomm-internal-build-and-test-single-os.yml
+    secrets: inherit
+    with:
+      has_code_changes: ${{ needs['path-filter'].outputs.code == 'true' }}
+      nightly_build: ${{ inputs.nightly_build }}
+      target_arch: x86_64
+      testdata_archive_artifact_name: testdata-zip
+      target_py_vsn: ${{ inputs.target_py_vsn }}
+
+  lint:
+    if: ${{ inputs.do_all }}
+    runs-on: ["self-hosted", "X64", "Linux", "Build"]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Run Linting Tool
+        run: |
+          python3 qcom/build_and_test.py lint
+
+  build-android-aarch64:
+    if: ${{ inputs.do_all }}
+    needs: [archive-testdata, path-filter]
+    runs-on: ["self-hosted", "X64", "Linux", "Build"]
+    steps:
+      - uses: actions/checkout@v6
+        # Submodules omitted here; initialized below only when a build is needed.
+      - name: Initialize submodules
+        if: ${{ needs['path-filter'].outputs.code == 'true' }}
+        run: git submodule update --init --recursive
+
+      # Artifactory steps are no-ops on fork PRs (secrets unavailable). The build still validates the change.
+      - name: Setup JFrog CLI
+        if: ${{ needs['path-filter'].outputs.code == 'true' && env.BUILD_ARTIFACTORY_REPO != '' }}
+        uses: jfrog/setup-jfrog-cli@v5
+        with:
+          disable-auto-build-publish: true
+          disable-job-summary: true
+        env:
+          JF_URL: ${{ secrets.BUILD_ARTIFACTORY_URL }}
+          JF_ACCESS_TOKEN: ${{ secrets.BUILD_ARTIFACTORY_TOKEN }}
+
+      - name: Build Android
+        if: ${{ needs['path-filter'].outputs.code == 'true' }}
+        run: |
+          python3 qcom/build_and_test.py archive_ort_android_aarch64
+
+      - name: Upload Test Archive to Artifactory
+        if: ${{ needs['path-filter'].outputs.code == 'true' && env.BUILD_ARTIFACTORY_REPO != '' }}
+        uses: ./.github/actions/upload-ci-artifact
+        with:
+          name: "android-aarch64-pyNone-tests"
+          src_pattern: onnxruntime-tests-android-aarch64.zip
+
+  test-android-aarch64:
+    if: ${{ inputs.do_all }}
+    needs: [build-android-aarch64, path-filter]
+    uses: ./.github/workflows/qualcomm-internal-qdc-test.yml
+    secrets: inherit
+    with:
+      has_code_changes: ${{ needs['path-filter'].outputs.code == 'true' }}
+      target_os: android
+      target_arch: aarch64
+      testdata_archive_artifact_name: testdata-zip

@@ -1,0 +1,423 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: MIT
+
+import os
+from collections.abc import Collection, Iterable, Mapping
+from pathlib import Path
+from typing import Literal
+
+from ..github import is_host_github_runner
+from ..task import (
+    BashScriptsWithVenvTask,
+    CompositeTask,
+    ExtractArchiveTask,
+    PyTestTask,
+    RemovePathsTask,
+    RunExecutablesTask,
+    RunExecutablesWithVenvTask,
+    RunInTempDirectoryTask,
+    UpdateJsonFileTask,
+)
+from ..typing import BuildConfigT, TargetArchLinuxT, TargetArchWindowsT, TargetPyVersionT
+from ..util import BASH_EXECUTABLE, REPO_ROOT, git_head_sha
+from .docker import DOCKER_REPO_ROOT, MANYLINUX_2_34_AARCH64_TAG, DockerBuildAndTestTask
+from .windows import RunPowershellScriptsTask
+
+
+def get_ort_version() -> str:
+    return (REPO_ROOT / "VERSION_NUMBER").read_text().strip()
+
+
+class BuildEpDockerTask(CompositeTask):
+    """Build ONNX Runtime for Linux inside a Docker container."""
+
+    def __init__(
+        self,
+        group_name: str | None,
+        target_arch: TargetArchLinuxT,
+        config: BuildConfigT,
+        target_py_version: TargetPyVersionT | None,
+        qairt_sdk_root: Path | None,
+        ccache_root: Path | None,
+        build_archive: bool = False,
+        inner_task: str = "_build_ort_linux_aarch64_manylinux_2_34",
+        docker_tag: str = MANYLINUX_2_34_AARCH64_TAG,
+        platform: str = "linux/aarch64",
+    ) -> None:
+        dist_rel_dir = Path("build") / f"linux-{target_arch}" / config / "dist"
+
+        super().__init__(
+            group_name,
+            [
+                RemovePathsTask(
+                    "Deleting wheels to workaround ORT build bug",
+                    (REPO_ROOT / dist_rel_dir).glob("*.whl"),
+                ),
+                DockerBuildAndTestTask(
+                    "Building ONNX Runtime inside a container",
+                    [inner_task],
+                    target_py_version,
+                    docker_tag,
+                    volumes={REPO_ROOT: DOCKER_REPO_ROOT},
+                    venv_path=DOCKER_REPO_ROOT / "build" / "venv.build",
+                    qairt_sdk_root=qairt_sdk_root,
+                    ccache_root=ccache_root,
+                    build_archive=build_archive,
+                    platform=platform,
+                ),
+            ],
+        )
+
+
+class BuildEpLinuxTask(BashScriptsWithVenvTask):
+    """Build ONNX Runtime on a Linux host."""
+
+    def __init__(
+        self,
+        group_name: str | None,
+        venv: Path | None,
+        target_platform: Literal["android", "linux"],
+        target_arch: TargetArchLinuxT,
+        config: BuildConfigT,
+        target_py_version: TargetPyVersionT | None,
+        ort_prebuilt_root: Path | None,
+        qairt_sdk_root: Path | None,
+        mode: str,
+        extra_args: Iterable[str] | None = None,
+        env: Mapping[str, str] | None = None,
+        build_archive: bool = False,
+    ) -> None:
+        cmd = [
+            str(REPO_ROOT / "qcom" / "scripts" / "linux" / "build.sh"),
+            f"--target-arch={target_arch}",
+            f"--target-platform={target_platform}",
+            f"--config={config}",
+            f"--mode={mode}",
+        ]
+
+        if target_py_version is not None:
+            cmd.append(f"--target-py-version={target_py_version}")
+
+        if ort_prebuilt_root is not None:
+            cmd.append(f"--ort-home={ort_prebuilt_root}")
+
+        if qairt_sdk_root is not None:
+            cmd.append(f"--qairt-sdk-root={qairt_sdk_root}")
+
+        if build_archive:
+            cmd.append("--build-archive")
+
+        if extra_args is not None:
+            cmd.extend(extra_args)
+
+        super().__init__(group_name, venv, [cmd], env=ort_build_env_vars(env))
+
+
+class BuildEpWindowsTask(RunPowershellScriptsTask):
+    def __init__(
+        self,
+        group_name: str | None,
+        venv: Path | None,
+        target_arch: TargetArchWindowsT,
+        config: BuildConfigT,
+        target_py_version: TargetPyVersionT | None,
+        ort_prebuilt_root: Path | None,
+        qairt_sdk_root: Path | None,
+        mode: str,
+        build_as_x: bool = False,
+        build_nuget: bool = False,
+        build_archive: bool = False,
+    ) -> None:
+        cmd = [
+            str(REPO_ROOT / "qcom" / "scripts" / "windows" / "build.ps1"),
+            "-Arch",
+            target_arch,
+            "-Config",
+            config,
+            "-Mode",
+            mode,
+        ]
+
+        if venv is not None:
+            cmd.extend(["-PyVEnv", str(venv).replace(" ", "` ")])
+        if ort_prebuilt_root is not None:
+            cmd.extend(["-OrtPrebuiltRoot", str(ort_prebuilt_root).replace(" ", "` ")])
+        if qairt_sdk_root is not None:
+            cmd.extend(["-QairtSdkRoot", str(qairt_sdk_root).replace(" ", "` ")])
+
+        if build_as_x:
+            cmd.extend(["-BuildAsX", "1"])
+
+        if target_py_version is not None:
+            cmd.extend(["-TargetPyVersion", str(target_py_version)])
+
+        if build_nuget:
+            cmd.extend(["-BuildNuget", "1"])
+
+        if build_archive:
+            cmd.extend(["-BuildArchive", "1"])
+
+        super().__init__(group_name, [cmd], env=ort_build_env_vars())
+
+
+class GenerateCoverageTask(BashScriptsWithVenvTask):
+    """Run generate_coverage.sh to collect gcov data and produce an HTML coverage report.
+
+    Uses BashScriptsWithVenvTask (rather than BashScriptsTask) intentionally:
+    Phase 2 will invoke Python tools (e.g. lcov_cobertura, diff-cover) that require
+    the venv to be active.
+    """
+
+    def __init__(
+        self,
+        group_name: str | None,
+        venv: Path | None,
+        build_dir: Path,
+        config: str = "RelWithDebInfo",
+    ) -> None:
+        cmd = [
+            str(REPO_ROOT / "qcom" / "scripts" / "linux" / "generate_coverage.sh"),
+            f"--build-dir={build_dir}",
+            f"--config={config}",
+        ]
+        super().__init__(group_name, venv, [cmd])
+
+
+class RunAsanTask(BashScriptsWithVenvTask):
+    """Run onnxruntime_provider_test under AddressSanitizer via run_asan.sh.
+
+    The script wraps the binary with asan_filter_leaks.sh so that only Direct
+    leaks (ORT/test-side) and ASan heap errors fail the run; Indirect leaks
+    rooted in stripped QAIRT backend libraries are treated as known noise.
+    """
+
+    def __init__(
+        self,
+        group_name: str | None,
+        venv: Path | None,
+        build_dir: Path,
+        config: str = "Debug",
+    ) -> None:
+        cmd = [
+            str(REPO_ROOT / "qcom" / "scripts" / "linux" / "run_asan.sh"),
+            f"--build-dir={build_dir}",
+            f"--config={config}",
+        ]
+        super().__init__(group_name, venv, [cmd])
+
+
+class GenerateDiffCoverageTask(CompositeTask):
+    """Generate patch/diff coverage report using diff-cover.
+
+    Chains three steps:
+      1. git fetch origin <base_branch>   — ensures the base ref is available locally.
+      2. git diff <base_branch>...HEAD    — captures the PR diff as a unified diff file.
+      3. generate_diff_coverage.sh        — converts coverage.xml + patch.diff into an
+                                            HTML/text diff-cover report.
+
+    Prerequisite: coverage.xml must already exist under <build_dir>/<config>/coverage/,
+    i.e. GenerateCoverageTask must have run first (enforced via @depends in build_and_test.py).
+    """
+
+    def __init__(
+        self,
+        group_name: str | None,
+        venv: Path | None,
+        build_dir: Path,
+        config: str = "RelWithDebInfo",
+        base_branch: str = "origin/main",
+    ) -> None:
+        diff_file = build_dir / config / "patch.diff"
+        coverage_xml = build_dir / config / "coverage" / "coverage.xml"
+
+        diff_script_cmd = [
+            str(REPO_ROOT / "qcom" / "scripts" / "linux" / "generate_diff_coverage.sh"),
+            f"--coverage-xml={coverage_xml}",
+            f"--diff-file={diff_file}",
+        ]
+
+        super().__init__(
+            group_name,
+            [
+                RunExecutablesTask(
+                    "Fetching base branch",
+                    [["git", "fetch", "origin", base_branch.removeprefix("origin/")]],
+                ),
+                RunExecutablesTask(
+                    "Generating git diff",
+                    [[BASH_EXECUTABLE, "-c", f"git diff {base_branch}...HEAD > {diff_file}"]],
+                ),
+                BashScriptsWithVenvTask(
+                    "Generating diff coverage report",
+                    venv,
+                    [diff_script_cmd],
+                ),
+            ],
+        )
+
+
+class GenerateFileCoverageExcelTask(RunExecutablesWithVenvTask):
+    """Generate a per-day per-file coverage Excel snapshot from a Cobertura XML report.
+
+    Calls update_coverage_excel.py with the coverage.xml produced by
+    GenerateCoverageTask and writes a fresh Excel file containing today's
+    line% and branch% for every QNN EP source file.
+
+    # TODO: enable the aggregate CI workflow to merge daily snapshots into
+    # a 30-day history report.
+
+    Prerequisite: coverage.xml must already exist under
+    <build_dir>/<config>/coverage/ (enforced via @depends in build_and_test.py).
+    """
+
+    def __init__(
+        self,
+        group_name: str | None,
+        venv: Path | None,
+        build_dir: Path,
+        excel_file: Path,
+        commit_sha: str,
+        config: str = "RelWithDebInfo",
+    ) -> None:
+        coverage_xml = build_dir / config / "coverage" / "coverage.xml"
+        cmd = [
+            "python3",
+            str(REPO_ROOT / "qcom" / "scripts" / "linux" / "update_coverage_excel.py"),
+            f"--coverage-xml={coverage_xml}",
+            f"--excel={excel_file}",
+            f"--commit-sha={commit_sha}",
+        ]
+        super().__init__(group_name, venv, [cmd])
+
+
+class AdbTestsTask(RunInTempDirectoryTask):
+    def __init__(
+        self,
+        group_name: str | None,
+        venv: Path | None,
+        platform: Literal["android", "linux"],
+        target_arch: Literal["aarch64", "aarch64_manylinux_2_34", "aarch64_oe_gcc11_2"],
+    ) -> None:
+        self.__venv = venv
+        self.__platform = platform
+        self.__target_arch = target_arch
+        super().__init__(group_name, self.make_test_task, "AdbTests-")
+
+    # This is a pretty slow way to do this, but it's easy to implement
+    # and essentially free to maintain. If you find yourself using this
+    # often enough that your life would be better if we didn't roundtrip
+    # through a zip file, please open a Jira and we'll invest more here.
+    def make_test_task(self, tmpdir: Path) -> CompositeTask:
+        # Local import to avoid circular dependency
+        from ..tools import get_onnx_models_root  # noqa: PLC0415
+
+        test_archive_ext = "zip" if self.__platform == "android" else "tar.bz2"
+
+        if "ORT_TEST_CONFIG_PATH" in os.environ:
+            test_config_src = Path(os.environ["ORT_TEST_CONFIG_PATH"])
+        else:
+            test_config_src = (
+                REPO_ROOT
+                / "qcom"
+                / "scripts"
+                / "linux"
+                / "appium"
+                / "configs"
+                / f"{self.__platform}-{self.__target_arch}.jsonc"
+            )
+
+        env = dict(os.environ)
+        env["ORT_TEST_CONFIG_PATH"] = str(tmpdir / "test_config.jsonc")
+
+        return CompositeTask(
+            group_name=None,
+            tasks=[
+                UpdateJsonFileTask(
+                    "Creating test config file",
+                    self.__venv,
+                    test_config_src,
+                    tmpdir / "test_config.jsonc",
+                    {
+                        "qdc_host_path": str(tmpdir),
+                        "host_onnx_model_test_path": str(get_onnx_models_root(self.__venv)),
+                    },
+                ),
+                ExtractArchiveTask(
+                    "Extracting per-arch test archive",
+                    REPO_ROOT
+                    / "build"
+                    / f"onnxruntime-tests-{self.__platform}-{self.__target_arch}.{test_archive_ext}",
+                    tmpdir,
+                ),
+                BashScriptsWithVenvTask(
+                    "Extracting testdata archive",
+                    None,
+                    [
+                        [
+                            "python3",
+                            str(REPO_ROOT / "qcom" / "scripts" / "all" / "extract_testdata.py"),
+                            "--target-platform",
+                            f"{self.__platform}-{self.__target_arch}",
+                            "--archive",
+                            str(REPO_ROOT / "build" / f"onnxruntime-testdata.{test_archive_ext}"),
+                            "--repo-root",
+                            str(tmpdir),
+                        ]
+                    ],
+                ),
+                PyTestTask(
+                    "Testing ONNX Runtime with a local device",
+                    self.__venv,
+                    ["tests"],
+                    env=env,
+                    cwd=REPO_ROOT / "qcom" / "scripts" / "linux" / "appium",
+                ),
+            ],
+        )
+
+
+class QdcTestsTask(RunExecutablesWithVenvTask):
+    def __init__(
+        self,
+        group_name: str | None,
+        venv: Path | None,
+        platforms: Collection[Literal["android", "qualcomm_linux", "windows"]],
+        extra_args: Iterable[str] | None = None,
+    ) -> None:
+        if "QDC_API_TOKEN" not in os.environ:
+            raise RuntimeError("QDC_API_TOKEN must be set in the environment to run tests on QDC.")
+
+        cmd = [
+            "python",
+            str(REPO_ROOT / "qcom" / "scripts" / "all" / "qdc_runner.py"),
+            f"--log-dir={REPO_ROOT / 'build' / 'qdc-%p'}",  # %p is expanded to "android" or "windows"
+        ]
+
+        if len(platforms) > 0:
+            cmd.extend(["--enable-platforms", *platforms])
+
+        if extra_args is not None:
+            cmd.extend(extra_args)
+
+        # qualcomm_linux jobs download the .tar.bz2 testdata artifact; everything else uses .zip.
+        # qdc_runner._resolve_testdata_archive() probes the alternate extension as a safety net,
+        # but pointing at the right file from the start makes intent clear when reading this task
+        # in isolation.
+        testdata_ext = "tar.bz2" if set(platforms) == {"qualcomm_linux"} else "zip"
+        testdata_archive = REPO_ROOT / "build" / f"onnxruntime-testdata.{testdata_ext}"
+        cmd.append(f"--testdata-archive={testdata_archive}")
+
+        if is_host_github_runner():
+            actor = os.environ["GITHUB_ACTOR"]
+            branch = os.environ["GITHUB_REF_NAME"]
+            cmd.append(f"--name={actor}-{branch}")
+            cmd.append(f"--on-behalf-of={actor}")
+
+        super().__init__(group_name, venv, [cmd])
+
+
+def ort_build_env_vars(old_env: Mapping[str, str] | None = None) -> dict[str, str]:
+    env = os.environ.copy() if old_env is None else dict(old_env)
+    if env.get("ORT_NIGHTLY_BUILD", "0") == "1":
+        env["Build_SourceVersion"] = git_head_sha()
+    return env

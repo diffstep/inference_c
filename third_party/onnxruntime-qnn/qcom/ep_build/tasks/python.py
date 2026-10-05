@@ -1,0 +1,432 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: MIT
+
+import functools
+import operator
+import os
+from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
+from typing import Literal
+from urllib.parse import urlparse
+
+from ..task import (
+    CompositeTask,
+    ConditionalTask,
+    NoOpTask,
+    PyTestTask,
+    RunExecutablesTask,
+    RunExecutablesWithVenvTask,
+    RunInTempDirectoryTask,
+    Task,
+)
+from ..tools import (
+    PythonExecutableArchT,
+    get_model_zoo_root,
+    get_onnx_models_root,
+    get_python_executable,
+    get_qualcomm_device_cloud_sdk_root,
+)
+from ..typing import TargetArchT
+from ..util import (
+    MSFT_CI_REQUIREMENTS_RELPATH,
+    REPO_ROOT,
+    is_host_linux,
+    is_host_windows,
+)
+from .build import BuildConfigT, TargetPyVersionT, get_ort_version
+
+
+def uv_pip_install_cmd(
+    requirements: Iterable[Path] = [],
+    packages: Iterable[Path] = [],
+    find_links: Iterable[Path] = [],
+    index_url: str | None = None,
+) -> list[str]:
+    cmd = (
+        ["uv", "pip", "install", "--native-tls"]
+        + [f"--requirement={r}" for r in requirements]
+        + [f"--find-links={p}" for p in find_links]
+        + [str(p) for p in packages]
+    )
+    if index_url is not None:
+        url_parts = urlparse(index_url)
+        cmd.extend([f"--trusted-host={url_parts.hostname}", f"--index-url={index_url}"])
+    return cmd
+
+
+class PipInstallTask(RunExecutablesWithVenvTask):
+    def __init__(
+        self,
+        group_name: str | None,
+        venv_path: Path,
+        requirements: Iterable[Path] = [],
+        packages: Iterable[Path] = [],
+        index_url: str | None = None,
+    ) -> None:
+        super().__init__(
+            group_name,
+            venv=venv_path,
+            executables_and_args=[
+                uv_pip_install_cmd(requirements=requirements, packages=packages, index_url=index_url)
+            ],
+        )
+
+
+class PipInstallQcomDevRequirements(RunExecutablesWithVenvTask):
+    def __init__(
+        self,
+        group_name: str | None,
+        venv_path: Path,
+        qdc: bool,
+    ) -> None:
+        requirements: str = "requirements-qdc.txt" if qdc else "requirements.txt"
+        req_path = REPO_ROOT / "qcom" / requirements
+        package_manager_venv = venv_path.parent / (venv_path.name + "-pkg-manager")
+        if qdc:
+            super().__init__(
+                group_name,
+                venv=venv_path,
+                executables_and_args=lambda: [
+                    uv_pip_install_cmd(
+                        requirements=[req_path],
+                        find_links=[get_qualcomm_device_cloud_sdk_root(package_manager_venv)],
+                    )
+                ],
+            )
+        else:
+            super().__init__(
+                group_name,
+                venv=venv_path,
+                executables_and_args=[uv_pip_install_cmd(requirements=[req_path])],
+            )
+
+
+class CreateOrtVenvTask(CompositeTask):
+    def __init__(
+        self,
+        python_executable: Path,
+        venv_path: Path,
+    ) -> None:
+        super().__init__(
+            group_name=None,
+            tasks=[
+                CreateVenvTask(python_executable=python_executable, venv_path=venv_path),
+                PipInstallTask(
+                    f"Installing ORT build requirements into {venv_path}",
+                    venv_path,
+                    requirements=[
+                        REPO_ROOT / MSFT_CI_REQUIREMENTS_RELPATH,
+                        REPO_ROOT / "requirements-dev.txt",
+                    ],
+                ),
+                RunExecutablesWithVenvTask(
+                    group_name="Initializing lintrunner",
+                    venv=venv_path,
+                    executables_and_args=[
+                        ["lintrunner", "init"],
+                        uv_pip_install_cmd(
+                            requirements=[
+                                REPO_ROOT / "qcom" / "requirements.txt",
+                            ],
+                        ),
+                    ],
+                ),
+                PipInstallTask(
+                    f"Installing QCOM build requirements into {venv_path}",
+                    venv_path,
+                    requirements=[
+                        REPO_ROOT / "qcom" / "requirements.txt",
+                    ],
+                ),
+            ],
+        )
+
+
+class CreateQdcVenvTask(CompositeTask):
+    def __init__(self, python_executable: Path, venv_path: Path) -> None:
+        pkg_manager_venv = venv_path.parent / (venv_path.name + "-pkg-manager")
+        super().__init__(
+            group_name=None,
+            tasks=[
+                CreateVenvTask(python_executable=python_executable, venv_path=pkg_manager_venv),
+                PipInstallTask(
+                    f"Installing package manager requirements into {pkg_manager_venv}",
+                    pkg_manager_venv,
+                    requirements=[REPO_ROOT / "qcom" / "requirements.txt"],
+                ),
+                CreateVenvTask(python_executable=python_executable, venv_path=venv_path),
+                RunExecutablesWithVenvTask(
+                    f"Installing QDC build requirements into {venv_path}",
+                    venv=venv_path,
+                    executables_and_args=lambda: [
+                        uv_pip_install_cmd(
+                            requirements=[REPO_ROOT / "qcom" / "requirements-qdc.txt"],
+                            find_links=[get_qualcomm_device_cloud_sdk_root(pkg_manager_venv)],
+                        )
+                    ],
+                ),
+            ],
+        )
+
+
+class CreateVenvTask(CompositeTask):
+    def __init__(self, python_executable: Path, venv_path: Path) -> None:
+        super().__init__(
+            group_name=f"Creating virtual environment at {venv_path}",
+            tasks=[
+                ConditionalTask(
+                    group_name=None,
+                    condition=venv_path.exists,
+                    true_task=NoOpTask(),
+                    false_task=CompositeTask(
+                        group_name=None,
+                        tasks=[
+                            RunExecutablesTask(
+                                group_name=None,
+                                executables_and_args=[
+                                    [
+                                        str(python_executable),
+                                        "-m",
+                                        "venv",
+                                        str(venv_path),
+                                    ],
+                                ],
+                            ),
+                            RunExecutablesWithVenvTask(
+                                group_name=None,
+                                venv=venv_path,
+                                executables_and_args=[
+                                    [
+                                        "python",
+                                        "-m",
+                                        "pip",
+                                        "install",
+                                        "pip",
+                                        "--upgrade",
+                                    ],
+                                    ["python", "-m", "pip", "install", "uv"],
+                                ],
+                            ),
+                        ],
+                    ),
+                ),
+            ],
+        )
+
+
+# Valid Windows Portable Executable (PE) types that a wheel can target.
+# Note that ARM64ec and ARM64x both require an AMD64 (not ARM64) Python interpreter.
+WheelPeArchT = Literal["arm64", "arm64ec", "arm64x"]
+
+
+class OrtWheelTestTask(RunInTempDirectoryTask):
+    def __init__(
+        self,
+        group_name: str | None,
+        build_venv: Path | None,
+        target_arch: TargetArchT,
+        py_version: TargetPyVersionT,
+        get_wheel: Callable[[], Path],
+        test_files_or_dirs: list[str],
+        get_test_env: Callable[[], Mapping[str, str]] | None = None,
+    ) -> None:
+        self.__build_venv = build_venv
+        self.__target_arch = target_arch
+        self.__target_py_version: TargetPyVersionT = py_version
+        self.__get_wheel = get_wheel
+        self.__test_files_or_dirs = test_files_or_dirs
+        self.__get_test_env = get_test_env
+        super().__init__(group_name, self.make_wheel_test, tmpdir_prefix="py-smoke-test-")
+
+    @property
+    def __python_exe_arch(self) -> PythonExecutableArchT:
+        target_arches: dict[str, PythonExecutableArchT] = {
+            "arm64": "arm64",
+            "arm64ec": "x86_64",
+            "arm64x": "x86_64",
+            "aarch64_manylinux_2_34": "arm64",
+            "x86_64_ubuntu_22_04": "x86_64",
+        }
+        py_arch = target_arches.get(self.__target_arch, None)
+        if py_arch is not None:
+            return py_arch
+        raise ValueError(f"Unknown wheel target arch {self.__target_arch}.")
+
+    def make_wheel_test(self, tmpdir: Path) -> Task:
+        venv_path = tmpdir / "venv"
+        python_exe = get_python_executable(self.__build_venv, self.__python_exe_arch, self.__target_py_version)
+        test_env = self.__get_test_env() if self.__get_test_env is not None else None
+
+        return CompositeTask(
+            None,
+            [
+                CreateVenvTask(python_exe, venv_path),
+                RunExecutablesWithVenvTask(
+                    group_name="Installing model test requirements",
+                    venv=venv_path,
+                    executables_and_args=[
+                        uv_pip_install_cmd(
+                            requirements=[REPO_ROOT / "qcom" / "model_test" / "requirements.txt"],
+                            packages=[self.__get_wheel()],
+                        )
+                    ],
+                ),
+                PyTestTask(
+                    group_name="Testing wheel",
+                    venv=venv_path,
+                    env=test_env,
+                    files_or_dirs=self.__test_files_or_dirs,
+                ),
+            ],
+        )
+
+
+class OrtWheelModelTestTask(OrtWheelTestTask):
+    def __init__(
+        self,
+        group_name: str | None,
+        venv: Path | None,
+        target_arch: TargetArchT,
+        config: BuildConfigT,
+        py_version: TargetPyVersionT,
+        test_files_or_dirs: list[str],
+        get_test_env: Callable[[], Mapping[str, str]],
+    ) -> None:
+        self.__target_arch = target_arch
+        self.__config = config
+        self.__py_version = py_version
+
+        super().__init__(
+            group_name,
+            venv,
+            target_arch,
+            py_version,
+            self.__find_wheel,
+            test_files_or_dirs,
+            get_test_env,
+        )
+
+    def __find_wheel(self) -> Path:
+        """
+        Finding the wheel is less straightforward than you might think. We have two issues to contend with:
+        1. When the task is created, the wheel might not yet exist since a build to produce it hasn't yet been run.
+           For that reason, this function is passed to the task.
+        2. It's possible that the wheel has a date embedded in its name. For example, if we're in CI and want to run
+           a wheel that was built on a different machine, the file was just emplaced here and we don't have a way to
+           reliabily predict its name (e.g., if the wheel was built yesterday).
+        """
+        # Either onnxruntime_qnn or onnxruntime_qnn_qcom_internal, depending on whether this is a "nightly" build.
+        package_name = "onnxruntime_qnn*"
+        py_vsn = f"cp{self.__py_version.replace('.', '')}"
+        if is_host_windows():
+            pe_arches = {
+                "arm64": "arm64",
+                "arm64ec": "amd64",
+                "x86_64": "amd64",
+            }
+            wheel_pe_arch = pe_arches[self.__target_arch]
+            build_root = REPO_ROOT / "build" / f"windows-{self.__target_arch}"
+            filename_glob = f"{package_name}-{get_ort_version()}*-{py_vsn}-{py_vsn}-win_{wheel_pe_arch}.whl"
+        elif is_host_linux():
+            wheel_arches: dict[str, str] = {
+                "aarch64_manylinux_2_34": "aarch64",
+                "x86_64_ubuntu_22_04": "x86_64",
+            }
+            wheel_arch = wheel_arches.get(self.__target_arch)
+            if wheel_arch is None:
+                raise ValueError(f"Unknown Linux wheel target arch {self.__target_arch}.")
+            build_root = REPO_ROOT / "build" / f"linux-{self.__target_arch}"
+            filename_glob = f"{package_name}-{get_ort_version()}*-{py_vsn}-{py_vsn}-manylinux*_{wheel_arch}.whl"
+        else:
+            raise ValueError("Unknown OS")
+
+        # The wheel has a date in its filename, was produced by a Visual Studio build, or both.
+        dist_dirs = [
+            build_root / self.__config / "dist",
+            build_root / self.__config / self.__config / "dist",
+        ]
+        found_wheels: list[Path] = sorted(
+            functools.reduce(operator.iadd, [list(d.glob(filename_glob)) for d in dist_dirs], []),
+            key=lambda f: f.stat().st_mtime,
+            reverse=True,
+        )
+        if len(found_wheels) == 0:
+            raise FileNotFoundError("Could not find onnxruntime wheel.")
+        return found_wheels[0]
+
+
+class OrtWheelSmokeTestTask(OrtWheelModelTestTask):
+    def __init__(
+        self,
+        group_name: str | None,
+        venv: Path | None,
+        target_arch: TargetArchT,
+        config: BuildConfigT,
+        py_version: TargetPyVersionT,
+    ) -> None:
+        super().__init__(
+            group_name,
+            venv,
+            target_arch,
+            config,
+            py_version,
+            [
+                str(REPO_ROOT / "qcom" / "model_test" / "smoke_test.py"),
+                str(REPO_ROOT / "qcom" / "model_test" / "model_zoo_test.py"),
+            ],
+            get_test_env=lambda: {
+                **os.environ,
+                "ORT_WHEEL_SMOKE_TEST_ROOT": str(get_onnx_models_root(venv) / "testdata" / "smoke"),
+                "ORT_MODEL_ZOO_TEST_ROOTS": str(get_model_zoo_root(venv) / "winml-cert"),
+                "ORT_MODEL_ZOO_TEST_XFAILS": "",
+            },
+        )
+
+
+class OrtWheelGpuModelTestTask(OrtWheelModelTestTask):
+    def __init__(
+        self,
+        group_name: str | None,
+        venv: Path | None,
+        target_arch: TargetArchT,
+        config: BuildConfigT,
+        py_version: TargetPyVersionT,
+    ) -> None:
+        super().__init__(
+            group_name,
+            venv,
+            target_arch,
+            config,
+            py_version,
+            [
+                str(REPO_ROOT / "qcom" / "model_test" / "model_zoo_test.py"),
+            ],
+            get_test_env=lambda: {
+                **os.environ,
+                "ORT_MODEL_ZOO_TEST_ROOTS": str(get_model_zoo_root(venv) / "winml-cert-gpu"),
+                "ORT_MODEL_ZOO_BACKEND": "gpu",
+            },
+        )
+
+
+class RunLinterTask(CompositeTask):
+    def __init__(self, venv_path: Path, auto_fix: bool = False) -> None:
+        lintrunner_cmd = [
+            "lintrunner",
+            "--configs",
+            f"{REPO_ROOT}/.lintrunner.toml",
+            "--force-color",
+            "--all-files",
+            "-v",
+        ] + (["-a"] if auto_fix else [])
+
+        super().__init__(
+            group_name="Run source linter",
+            tasks=[
+                RunExecutablesWithVenvTask(
+                    group_name=None,
+                    venv=venv_path,
+                    executables_and_args=[lintrunner_cmd],
+                )
+            ],
+        )

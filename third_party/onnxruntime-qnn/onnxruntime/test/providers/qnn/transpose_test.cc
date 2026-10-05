@@ -1,0 +1,141 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#if !defined(ORT_MINIMAL_BUILD)
+
+#include <string>
+
+#include "test/providers/qnn/qnn_test_utils.h"
+#include "test/unittest_util/qdq_test_utils.h"
+
+#include "gtest/gtest.h"
+
+namespace onnxruntime {
+namespace test {
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
+
+// Function that builds a model with a Transpose operator.
+template <typename DataType>
+GetTestModelFn BuildTransposeTestCase(const TestInputDef<DataType>& input_def,
+                                      const std::vector<ONNX_NAMESPACE::AttributeProto>& attrs) {
+  return [input_def, attrs](ModelTestBuilder& builder) {
+    MakeTestInput<DataType>(builder, "input", input_def);
+
+    builder.MakeOutput("Y");
+
+    builder.AddNode("Transpose",
+                    "Transpose",
+                    {"input"},
+                    {"Y"},
+                    kOnnxDomain,
+                    attrs);
+  };
+}
+
+// Function that builds a QDQ model with a Transpose operator.
+template <typename QuantType>
+static GetTestQDQModelFn<QuantType> BuildQDQTransposeTestCase(const TestInputDef<float>& input_def,
+                                                              const std::vector<ONNX_NAMESPACE::AttributeProto>& attrs) {
+  return [input_def, attrs](ModelTestBuilder& builder, std::vector<QuantParams<QuantType>>& output_qparams) {
+    QNN_TEST_UNUSED_PARAMETER(output_qparams);
+    // input
+    MakeTestInput(builder, "input", input_def);
+
+    // input -> Q -> DQ -> input_qdq
+    const QuantParams<QuantType> input_qparams = GetTestInputQuantParams<QuantType>(input_def);
+    const std::string input_qdq =
+        AddQDQNodePair<QuantType>(builder, "qdq_in", "input",
+                                  input_qparams.scale, input_qparams.zero_point);
+
+    builder.AddNode("Transpose",
+                    "Transpose",
+                    {input_qdq},
+                    {"Y"},
+                    kOnnxDomain,
+                    attrs);
+
+    AddQDQNodePairWithOutputAsGraphOutput<QuantType>(builder,
+                                                     "qdq_out",
+                                                     "Y",
+                                                     input_qparams.scale,
+                                                     input_qparams.zero_point);
+  };
+}
+
+/**
+ * Runs an Transpose model on the QNN HTP backend. Checks the QDQ graph node assignment, and that inference
+ * outputs for QNN and CPU match.
+ *
+ * \param input_def The data (int32_t) input's definition (shape, is_initializer, data).
+ * \attrs node attributes
+ * \param expected_ep_assignment How many nodes are expected to be assigned to QNN (All, Some, or None).
+ */
+template <typename QuantType = uint8_t>
+static void RunTransposeQDQTest(const TestInputDef<float>& input_def,
+                                const std::vector<ONNX_NAMESPACE::AttributeProto>& attrs,
+                                ExpectedEPNodeAssignment expected_ep_assignment) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+
+  // Runs model with DQ-> Transpose -> Q and compares the outputs of the CPU and QNN EPs.
+  TestQDQModelAccuracy(BuildTransposeTestCase<float>(input_def, attrs),
+                       BuildQDQTransposeTestCase<QuantType>(input_def, attrs),
+                       provider_options,
+                       18,
+                       expected_ep_assignment);
+}
+
+/**
+ * Runs an Transpose model on the QNN HTP backend. Checks the graph node assignment, and that inference
+ * outputs for QNN and CPU match.
+ *
+ * \param input_def The data (int32_t) input's definition (shape, is_initializer, data).
+ * \attrs node attributes
+ * \param expected_ep_assignment How many nodes are expected to be assigned to QNN (All, Some, or None).
+ */
+template <typename DataType>
+static void RunTransposeNonQDQOnHTP(const TestInputDef<DataType>& input_def,
+                                    const std::vector<ONNX_NAMESPACE::AttributeProto>& attrs,
+                                    ExpectedEPNodeAssignment expected_ep_assignment,
+                                    float fp32_abs_err = 1e-5f) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+
+  RunQnnModelTest(BuildTransposeTestCase<DataType>(input_def, attrs),
+                  provider_options,
+                  13,
+                  EPVerificationParams{expected_ep_assignment, ElementwiseAbsoluteVerifier(fp32_abs_err)});
+}
+
+// Check that QNN compiles DQ -> Transpose -> Q as a single unit.
+TEST_F(QnnHTPBackendTests, TransposeQDQU8) {
+  RunTransposeQDQTest(TestInputDef<float>({1, 3, 224, 128}, false, 0.0f, 1.0f),
+                      {test::MakeAttribute("perm", std::vector<int64_t>{0, 2, 3, 1})},
+                      ExpectedEPNodeAssignment::All);
+}
+
+// Check that QNN supports Transpose with int32 data input on HTP
+TEST_F(QnnHTPBackendTests, TransposeInt32OnHTP) {
+  RunTransposeNonQDQOnHTP<int32_t>(TestInputDef<int32_t>({1, 3, 224, 128}, false, -100, 100),
+                                   {test::MakeAttribute("perm", std::vector<int64_t>{0, 2, 3, 1})},
+                                   ExpectedEPNodeAssignment::All);
+}
+
+// Check that QNN supports Transpose with float32 data input on HTP
+// Since QAIRT 2.35, default float precision on QNN HTP became FP16.
+// Converting FP32 -> FP16 -> FP32 may introduce minor accuracy loss.
+// For example, a value of 7.64300251 could become 7.64453173 after the conversion.
+// The expected difference is approximately 0.00152922, so the tolerance is adjusted to 5e-3f.
+TEST_F(QnnHTPBackendTests, TransposeFloat32OnHTP) {
+  RunTransposeNonQDQOnHTP<float>(TestInputDef<float>({1, 3, 224, 128}, false, 0, 10.0f),
+                                 {test::MakeAttribute("perm", std::vector<int64_t>{0, 2, 3, 1})},
+                                 ExpectedEPNodeAssignment::All, 5e-3f);
+}
+
+#endif  // defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
+
+}  // namespace test
+}  // namespace onnxruntime
+
+#endif

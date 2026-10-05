@@ -1,0 +1,332 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#include "core/providers/qnn/builder/op_builder_factory.h"
+#include "core/providers/qnn/builder/opbuilder/base_op_builder.h"
+#include "core/providers/qnn/builder/qnn_model_wrapper.h"
+#include "core/providers/qnn/builder/qnn_utils.h"
+#include "core/providers/qnn/common/qnn_graph_utils.h"
+
+namespace onnxruntime {
+namespace qnn {
+
+class InstanceNormalizationOpBuilder : public BaseOpBuilder {
+ public:
+  InstanceNormalizationOpBuilder() : BaseOpBuilder("InstanceNormalizationOpBuilder") {}
+  ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(InstanceNormalizationOpBuilder);
+
+  Ort::Status IsOpSupported(QnnModelWrapper& qnn_model_wrapper,
+                            const OrtNodeUnit& node_unit,
+                            const Ort::Logger& logger) const override final ORT_MUST_USE_RESULT;
+
+ protected:
+  Ort::Status ProcessInputs(QnnModelWrapper& qnn_model_wrapper,
+                            const OrtNodeUnit& node_unit,
+                            const Ort::Logger& logger,
+                            std::vector<std::string>& input_names,
+                            bool do_op_validation) const override ORT_MUST_USE_RESULT;
+
+  Ort::Status ProcessScale(QnnModelWrapper& qnn_model_wrapper,
+                           const OrtNodeUnitIODef& input,
+                           const Ort::Logger& logger,
+                           std::vector<std::string>& input_names) const;
+
+  Ort::Status ProcessAttributesAndOutputs(QnnModelWrapper& qnn_model_wrapper,
+                                          const OrtNodeUnit& node_unit,
+                                          std::vector<std::string>&& input_names,
+                                          const Ort::Logger& logger,
+                                          bool do_op_validation) const override ORT_MUST_USE_RESULT;
+};
+
+// Instance normalization op is sensitive to data layout.
+// The nodes from 1st call of GetCapability do not get layout transformer applied, so their shapes are still NCHW.
+// The nodes from 2nd call of GetCapability get their layout transformed to NHWC.
+// Therefore, we need to check the node domain to determine if the layout has been transformed.
+Ort::Status InstanceNormalizationOpBuilder::IsOpSupported(QnnModelWrapper& qnn_model_wrapper,
+                                                          const OrtNodeUnit& node_unit,
+                                                          const Ort::Logger& logger) const {
+  ORT_UNUSED_PARAMETER(logger);
+
+  // Check input type is float for CPU.
+  const auto& inputs = node_unit.Inputs();
+  // Check input type is float for CPU. Can't use Qnn Op validation API since it's before layout transformation
+  RETURN_IF_ERROR(DataTypeCheckForCpuBackend(qnn_model_wrapper, inputs[0].type, ""));
+
+  std::vector<uint32_t> input_shape;
+  RETURN_IF_NOT(qnn_model_wrapper.GetOnnxShape(inputs[0].shape, input_shape), "Cannot get shape of input 0");
+  const size_t input_rank = input_shape.size();
+
+  RETURN_IF(input_rank <= 2 || input_rank > 5,
+            "QNN InstanceNorm only supports input ranks of size 3, 4, or 5.");
+
+  const uint32_t num_channels = (node_unit.Domain() == kMSInternalNHWCDomain) ? input_shape.back() : input_shape[1];
+
+  std::vector<uint32_t> scale_shape;
+  RETURN_IF_NOT(qnn_model_wrapper.GetOnnxShape(inputs[1].shape, scale_shape), "Cannot get shape of input 1 (scale)");
+  RETURN_IF(scale_shape.size() != 1 || scale_shape[0] != num_channels,
+            "QNN InstanceNorm input 1 (scale) must have 1D shape [channel].");
+
+  std::vector<uint32_t> bias_shape;
+  RETURN_IF_NOT(qnn_model_wrapper.GetOnnxShape(inputs[2].shape, bias_shape), "Cannot get shape of input 2 (bias)");
+  RETURN_IF(bias_shape.size() != 1 || bias_shape[0] != num_channels,
+            "QNN InstanceNorm input 2 (bias) must have 1D shape [channel].");
+
+  OrtNodeAttrHelper node_helper(node_unit);
+  const float epsilon = node_helper.Get("epsilon", 1e-05f);  // Default is 1e-05 according to ONNX spec.
+  RETURN_IF(epsilon <= 0.0f, "QNN InstanceNorm epsilon must be greater than 0.0");
+
+  // Continue Op validation if it's NHWC transformed
+  if (node_unit.Domain() == kMSInternalNHWCDomain) {
+    return AddToModelBuilder(qnn_model_wrapper, node_unit, logger, true);
+  }
+
+  return Ort::Status();
+}
+
+Ort::Status InstanceNormalizationOpBuilder::ProcessInputs(QnnModelWrapper& qnn_model_wrapper,
+                                                          const OrtNodeUnit& node_unit,
+                                                          const Ort::Logger& logger,
+                                                          std::vector<std::string>& input_names,
+                                                          bool do_op_validation) const {
+  const auto& inputs = node_unit.Inputs();
+
+  TensorInfo input0_info = {};
+  RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(inputs[0], input0_info));
+
+  // QNN InstanceNorm supports rank <= 4. Flatten rank-5 inputs ([N, D, H, W, C])
+  // to rank-4 ([N, D*H, W, C]): statistics run over the same per-(N, C) elements,
+  // so this is exact. Merge D*H to keep W intact.
+  if (input0_info.shape.size() == 5) {
+    const std::string& orig_input0_name = inputs[0].name;
+    const std::string op_input0_name = input0_info.is_initializer ? orig_input0_name
+                                                                  : utils::UniqueNameGenerator().New(orig_input0_name, "_reshape");
+    input_names.push_back(op_input0_name);
+
+    std::vector<uint8_t> initializer_data;
+    if (input0_info.is_initializer) {
+      RETURN_IF_ERROR(qnn_model_wrapper.UnpackInitializerData(input0_info.initializer_tensor, initializer_data));
+    }
+
+    const uint64_t merged_spatial = static_cast<uint64_t>(input0_info.shape[1]) * input0_info.shape[2];
+    RETURN_IF(merged_spatial > UINT32_MAX, "InstanceNormalization rank-5 D*H product exceeds uint32 range");
+    std::vector<uint32_t> op_shape = {
+        input0_info.shape[0],                   // N
+        static_cast<uint32_t>(merged_spatial),  // D*H
+        input0_info.shape[3],                   // W
+        input0_info.shape[4]                    // C
+    };
+
+    if (!input0_info.is_initializer) {
+      RETURN_IF(input0_info.quant_param.IsPerChannel(),
+                "Non-constant InstanceNormalization inputs only support per-tensor quantization");
+
+      // Add Reshape node to flatten the two leading spatial dims.
+      // We don't need to do this for initializers, because the element layout does not change. We can just
+      // modify the shape dimensions.
+      bool is_graph_input = qnn_model_wrapper.IsGraphInput(orig_input0_name);
+      RETURN_IF_ERROR(qnn_model_wrapper.AddReshapeNode(orig_input0_name,
+                                                       op_input0_name,
+                                                       input0_info.shape,
+                                                       op_shape,
+                                                       input0_info.qnn_data_type,
+                                                       input0_info.quant_param,
+                                                       do_op_validation,
+                                                       is_graph_input));
+    } else {
+      // A merge (unlike the unsqueeze below) cannot shift the quantization axis,
+      // so per-channel constants stay unsupported.
+      RETURN_IF(input0_info.quant_param.IsPerChannel(),
+                "Constant rank-5 InstanceNormalization inputs with per-channel quantization are not supported");
+    }
+
+    Qnn_TensorType_t tensor_type = qnn_model_wrapper.GetTensorType(op_input0_name);
+    QnnTensorWrapper input_tensorwrapper(op_input0_name, tensor_type, input0_info.qnn_data_type,
+                                         std::move(input0_info.quant_param), std::move(op_shape),
+                                         std::move(initializer_data));
+    RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(input_tensorwrapper)), "Failed to add tensor.");
+  } else if (IsNpuBackend(qnn_model_wrapper.GetQnnBackendType()) &&
+             input0_info.shape.size() == 3 && input0_info.shape[0] != 1) {
+    // HTP backend can only handle rank 3 inputs if the batch size is 1. If the batch size is not 1,
+    // QNN EP must reshape the input and output to (N, 1, W, C) and process the InstanceNorm as rank 4.
+    const std::string& orig_input0_name = inputs[0].name;
+    const std::string op_input0_name = input0_info.is_initializer ? orig_input0_name
+                                                                  : utils::UniqueNameGenerator().New(orig_input0_name, "_reshape");
+    input_names.push_back(op_input0_name);
+
+    std::vector<uint8_t> initializer_data;
+    if (input0_info.is_initializer) {
+      RETURN_IF_ERROR(qnn_model_wrapper.UnpackInitializerData(input0_info.initializer_tensor, initializer_data));
+    }
+
+    std::vector<uint32_t> op_shape = {
+        input0_info.shape[0],  // N
+        1,                     // Height == 1
+        input0_info.shape[1],  // Width
+        input0_info.shape[2]   // Channels
+    };
+
+    if (!input0_info.is_initializer) {
+      RETURN_IF(input0_info.quant_param.IsPerChannel(),
+                "Non-constant InstanceNormalization inputs only support per-tensor quantization");
+
+      // Add Reshape node to transform 1D input to 2D (i.e., set height to 1).
+      // We don't need to do this for initializers, because the element layout does not change. We can just
+      // modify the shape dimensions.
+      bool is_graph_input = qnn_model_wrapper.IsGraphInput(orig_input0_name);
+      RETURN_IF_ERROR(qnn_model_wrapper.AddReshapeNode(orig_input0_name,
+                                                       op_input0_name,
+                                                       input0_info.shape,
+                                                       op_shape,
+                                                       input0_info.qnn_data_type,
+                                                       input0_info.quant_param,
+                                                       do_op_validation,
+                                                       is_graph_input));
+    } else if (input0_info.quant_param.IsPerChannel()) {
+      // The reshape (unsqueeze) may require us to shift the quant parameter's axis.
+      RETURN_IF_ERROR(input0_info.quant_param.HandleUnsqueeze<uint32_t>(input0_info.shape, op_shape));
+    }
+
+    Qnn_TensorType_t tensor_type = qnn_model_wrapper.GetTensorType(op_input0_name);
+    QnnTensorWrapper input_tensorwrapper(op_input0_name, tensor_type, input0_info.qnn_data_type,
+                                         std::move(input0_info.quant_param), std::move(op_shape),
+                                         std::move(initializer_data));
+    RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(input_tensorwrapper)), "Failed to add tensor.");
+  } else {
+    RETURN_IF_ERROR(ProcessInput(qnn_model_wrapper, inputs[0], logger, input_names));  // Input 0
+  }
+
+  RETURN_IF_ERROR(ProcessScale(qnn_model_wrapper, inputs[1], logger, input_names));  // Scale
+  RETURN_IF_ERROR(ProcessInput(qnn_model_wrapper, inputs[2], logger, input_names));  // Bias
+
+  return Ort::Status();
+}
+
+Ort::Status InstanceNormalizationOpBuilder::ProcessScale(QnnModelWrapper& qnn_model_wrapper,
+                                                         const OrtNodeUnitIODef& input,
+                                                         const Ort::Logger& logger,
+                                                         std::vector<std::string>& input_names) const {
+  RETURN_IF_ERROR(ProcessInput(qnn_model_wrapper, input, logger, input_names));
+
+  // Turn SFIXED scale of InstanceNorm into UFIXED when it is constant
+  const auto& input_name = input.name;
+  bool is_const = qnn_model_wrapper.IsConstantInput(input_name);
+  bool is_npu = IsNpuBackend(qnn_model_wrapper.GetQnnBackendType());
+  if (is_npu && is_const) {
+    TensorInfo tensor_info = {};
+    RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(input, tensor_info));
+    const Qnn_QuantizeParams_t& quant_param = tensor_info.quant_param.Get();
+    if (tensor_info.qnn_data_type == QNN_DATATYPE_SFIXED_POINT_8) {
+      std::string convert_input_name = input_names.back();
+      std::string convert_output_name = utils::UniqueNameGenerator().New(convert_input_name, "_convert_s8_to_u8");
+      RETURN_IF_ERROR(utils::InsertConvertOp(
+          qnn_model_wrapper,
+          convert_input_name,
+          convert_output_name,
+          QNN_DATATYPE_SFIXED_POINT_8,
+          QNN_DATATYPE_UFIXED_POINT_8,
+          quant_param.scaleOffsetEncoding.offset,
+          quant_param.scaleOffsetEncoding.scale,
+          tensor_info.shape,
+          false,  // asymmetric
+          false   // do_op_validation
+          ));
+      input_names.pop_back();
+      input_names.push_back(convert_output_name);
+    }
+  }
+
+  return Ort::Status();
+}
+
+Ort::Status InstanceNormalizationOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_model_wrapper,
+                                                                        const OrtNodeUnit& node_unit,
+                                                                        std::vector<std::string>&& input_names,
+                                                                        const Ort::Logger& logger,
+                                                                        bool do_op_validation) const {
+  OrtNodeAttrHelper node_helper(node_unit);
+  std::vector<std::string> param_tensor_names;
+
+  const float epsilon = node_helper.Get("epsilon", 1e-05f);  // Default is 1e-05 according to ONNX spec.
+  RETURN_IF_ERROR(AddQnnScalar<float>(qnn_model_wrapper, node_unit.Index(), node_unit.Name(), epsilon,
+                                      QNN_OP_INSTANCE_NORM_PARAM_EPSILON, param_tensor_names));
+
+  const auto& outputs = node_unit.Outputs();
+
+  TensorInfo output_info = {};
+  RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(outputs[0], output_info));
+
+  // HTP backend can only handle rank 3 inputs/outputs if the batch size is 1. If the batch size is not 1,
+  // QNN EP must reshape the input and output to (N, 1, W, C) and process the InstanceNorm as rank 4.
+  // Rank-5 outputs are flattened the same way (see ProcessInputs).
+  const bool is_rank3_batch_wrap =
+      IsNpuBackend(qnn_model_wrapper.GetQnnBackendType()) &&
+      output_info.shape.size() == 3 && output_info.shape[0] != 1;
+  const bool is_rank5_flatten = output_info.shape.size() == 5;
+  if (!is_rank3_batch_wrap && !is_rank5_flatten) {
+    return ProcessOutputs(qnn_model_wrapper, node_unit,
+                          std::move(input_names),
+                          std::move(param_tensor_names),
+                          logger, do_op_validation, GetQnnOpType(node_unit.OpType()));
+  }
+
+  //
+  // The output is meant to be rank 3 with batch size != 1, or rank 5. Must create a QNN InstanceNorm
+  // op with a rank 4 output that is then reshaped back to the original rank.
+  //
+
+  const std::string& orig_output_name = outputs[0].name;
+  std::string op_output_name = utils::UniqueNameGenerator().New(orig_output_name, "_reshape");
+
+  std::vector<uint32_t> op_output_shape;
+  if (output_info.shape.size() == 5) {
+    const uint64_t merged_spatial = static_cast<uint64_t>(output_info.shape[1]) * output_info.shape[2];
+    RETURN_IF(merged_spatial > UINT32_MAX, "InstanceNormalization rank-5 D*H product exceeds uint32 range");
+    op_output_shape = {
+        output_info.shape[0],                   // N
+        static_cast<uint32_t>(merged_spatial),  // D*H
+        output_info.shape[3],                   // W
+        output_info.shape[4]                    // C
+    };
+  } else {
+    op_output_shape = {
+        output_info.shape[0],  // N
+        1,                     // H == 1
+        output_info.shape[1],  // W
+        output_info.shape[2]   // C
+    };
+  }
+
+  QnnTensorWrapper output_tensorwrapper(op_output_name, QNN_TENSOR_TYPE_NATIVE, output_info.qnn_data_type,
+                                        output_info.quant_param.Copy(), std::vector<uint32_t>(op_output_shape));
+  RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(output_tensorwrapper)), "Failed to add tensor.");
+  RETURN_IF_NOT(qnn_model_wrapper.CreateQnnNode(utils::UniqueNameGenerator().New(node_unit),
+                                                QNN_OP_PACKAGE_NAME_QTI_AISW,
+                                                GetQnnOpType(node_unit.OpType()),
+                                                std::move(input_names),
+                                                {op_output_name},
+                                                std::move(param_tensor_names),
+                                                do_op_validation),
+                "Failed to add node.");
+
+  const bool is_graph_output = qnn_model_wrapper.IsGraphOutput(orig_output_name);
+
+  // Add Reshape to convert QNN InstanceNorm output back to the original rank
+  // (as expected by the rest of the ONNX graph).
+  RETURN_IF_ERROR(qnn_model_wrapper.AddReshapeNode(op_output_name,
+                                                   orig_output_name,
+                                                   op_output_shape,
+                                                   output_info.shape,
+                                                   output_info.qnn_data_type,
+                                                   output_info.quant_param,
+                                                   do_op_validation,
+                                                   false,
+                                                   is_graph_output));
+  return Ort::Status();
+}
+
+void CreateInstanceNormalizationOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations) {
+  op_registrations.AddOpBuilder(op_type, std::make_unique<InstanceNormalizationOpBuilder>());
+}
+
+}  // namespace qnn
+}  // namespace onnxruntime

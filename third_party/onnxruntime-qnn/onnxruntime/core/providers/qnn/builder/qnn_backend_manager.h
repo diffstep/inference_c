@@ -1,0 +1,827 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#pragma once
+
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#include <libloaderapi.h>
+#include <set>
+#else
+#include <dlfcn.h>
+#endif
+
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#include "CPU/QnnCpuCommon.h"
+#include "HTP/QnnHtpContext.h"
+#include "HTP/QnnHtpDevice.h"
+#include "GPU/QnnGpuBackend.h"
+#include "QnnCommon.h"
+#include "QnnLog.h"
+#include "QnnTypes.h"
+#include "System/QnnSystemInterface.h"
+
+#include "core/providers/qnn/builder/ep_context_io_dispatch.h"
+#include "core/providers/qnn/builder/op_builder_factory.h"
+#include "core/providers/qnn/builder/op_package/op_package.h"
+#include "core/providers/qnn/builder/op_tracing/qnn_op_tracing_types.h"
+#include "core/providers/qnn/builder/qnn_configs_helper.h"
+#include "core/providers/qnn/builder/qnn_context_mem_handle_manager.h"
+#include "core/providers/qnn/builder/qnn_def.h"
+#include "core/providers/qnn/builder/qnn_htp_power_config_manager.h"
+#include "core/providers/qnn/builder/qnn_node_group/qnn_node_group.h"
+#include "core/providers/qnn/builder/qnn_backend_profiling_manager.h"
+#include "core/providers/qnn/builder/qnn_profile_serializer.h"
+#include "core/providers/qnn/ort_api.h"
+#include "core/providers/qnn/rpcmem_library.h"
+
+#ifdef QNN_FILE_MAPPED_WEIGHTS_AVAILABLE
+#include "core/providers/qnn/builder/qnn_file_mapping_interface.h"
+#endif
+
+namespace onnxruntime {
+namespace qnn {
+
+// Sets the QNN context priority config from a ContextPriority enum value.
+// Handles all 8 supported priority levels.
+Ort::Status SetQnnContextConfig(ContextPriority context_priority, QnnContext_Config_t& qnn_context_config);
+
+// Forward declaration.
+class QnnModel;
+class QnnBackendSystemDlcPlugin;
+
+class QnnSerializerConfig {
+ public:
+  virtual ~QnnSerializerConfig();
+
+  /**
+   * Create a config to write a DLC file for each graph using the Ir backend.
+   */
+  static std::unique_ptr<QnnSerializerConfig> CreateIr(std::string backend_path, std::string dlc_dir);
+
+  /**
+   * Create a config to write C++ source files using the Saver backend.
+   */
+  static std::unique_ptr<QnnSerializerConfig> CreateSaver(std::string backend_path);
+
+  /**
+   * Get the path to the serializer backend.
+   */
+  const std::string& GetBackendPath() const;
+
+  /**
+   * Set the name of the graph being serialized. This value may be used to determine the name
+   * of the output files.
+   *
+   * \param graph_name The name of the graph being serialized.
+   */
+  void SetGraphName(std::string graph_name);
+
+  /**
+   * Gets the name of the graph being serialized.
+   *
+   * \return graph_name The name of the graph being serialized.
+   */
+  const std::string& GetGraphName() const;
+
+  /**
+   * Get any QNN Graph configs required to configure this serializer and perform any
+   * preparation, such as creating output directories.
+   *
+   * \return nullptr or a null-terminated list of QnnGraph_Config_t*.
+   */
+  virtual const QnnGraph_Config_t** Configure() = 0;
+
+  /**
+   * Some serializers allow for GraphConfigs that are unrelated to serialization to be
+   * specified at context creation time, while others raise an error. If true, this
+   * serializer should be configured with graph configs for any applicable real (e.g., HTP)
+   * backend.
+   *
+   * \return true if the backend can be configured with non-serialization graph configs.
+   */
+  virtual bool SupportsArbitraryGraphConfigs() const = 0;
+
+  ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(QnnSerializerConfig);
+
+ protected:
+  QnnSerializerConfig(std::string backend_path);
+
+ private:
+  std::string backend_path_;
+  std::string graph_name_{"graph"};
+};
+
+// configuration values for QnnBackendManager creation
+struct QnnBackendManagerConfig {
+  std::string backend_path;
+  ProfilingLevel profiling_level_etw;
+  ProfilingLevel profiling_level;
+  std::string profiling_file_path;
+  ContextPriority context_priority;
+  std::shared_ptr<QnnSerializerConfig> qnn_serializer_config;
+  uint32_t device_id;
+  uint32_t htp_num_cores = 0;
+  QnnHtpDevice_Arch_t htp_arch;
+  uint32_t soc_model;
+  std::vector<OpPackage> op_packages;
+  bool skip_qnn_version_check;
+  // When true, framework op tracing is active for the session and the profiling
+  // CSV gains the `ONNX Source Ops` column. Provided here alongside the other
+  // profiling settings so it is set once at backend-manager construction and
+  // remains constant for the manager's lifetime.
+  bool enable_framework_op_trace = false;
+  bool skip_backend_op_validation = false;
+  // Caps the reused IO buffer size at context load. 0 = SDK default.
+  uint64_t reused_io_limit_mb = 0;
+  bool configure_host_mode = false;
+};
+
+class QnnBackendManager : public std::enable_shared_from_this<QnnBackendManager> {
+  friend class QnnBackendSystemDlcPlugin;
+
+ private:
+  // private tag to pass to constructor to ensure that constructor cannot be directly called externally
+  struct PrivateConstructorTag {};
+
+ public:
+  static std::shared_ptr<QnnBackendManager> Create(const QnnBackendManagerConfig& config,
+                                                   const ApiPtrs& api_ptrs,
+                                                   const Ort::Logger& logger) {
+    auto backend_manager = std::make_shared<QnnBackendManager>(config, api_ptrs, logger, PrivateConstructorTag{});
+    backend_manager->InitializeProfilingManager(config);
+    return backend_manager;
+  }
+
+  // Note: Creation should be done via Create(). This constructor is public so that it can be called from
+  // std::make_shared().
+  QnnBackendManager(const QnnBackendManagerConfig& config,
+                    const ApiPtrs& api_ptrs,
+                    const Ort::Logger& logger,
+                    PrivateConstructorTag)
+      : backend_path_(config.backend_path),
+        reused_io_limit_mb_(config.reused_io_limit_mb),
+        context_priority_(config.context_priority),
+        qnn_serializer_config_(config.qnn_serializer_config),
+        device_id_(config.device_id),
+        htp_num_cores_(config.htp_num_cores),
+        htp_arch_(config.htp_arch),
+        soc_model_(config.soc_model),
+        op_packages_(config.op_packages),
+        skip_qnn_version_check_(config.skip_qnn_version_check),
+        skip_backend_op_validation_(config.skip_backend_op_validation),
+        configure_host_mode_(config.configure_host_mode),
+        htp_power_config_manager_(power::HtpPowerConfigManager()),
+        api_ptrs_(api_ptrs),
+        logger_ptr_(&logger) {}
+
+  ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(QnnBackendManager);
+
+  ~QnnBackendManager();
+
+  // Caller owns *context_buffer and must delete[] it; recommend wrapping with std::unique_ptr.
+  Ort::Status GetContextBinaryBuffer(bool is_multi_soc_buffer,
+                                     /*out*/ unsigned char** context_buffer,
+                                     /*out*/ uint64_t& buffer_size);
+
+  Ort::Status LoadCachedQnnContextFromBuffer(
+      char* buffer,
+      uint64_t buffer_length,
+      const std::string& context_bin_filepath,
+      std::string node_name,
+      std::unordered_map<std::string, std::unique_ptr<qnn::QnnModel>>& qnn_models,
+      int64_t max_spill_fill_size,
+      const qnn::EpContextIoDispatch& io_dispatch,
+      bool is_multi_soc_buffer = false);
+
+  // Remove a single context handle from all tracking structures and free it via contextFree.
+  void ReleaseSpecificContextHandle(Qnn_ContextHandle_t context_handle);
+
+  // Adds a new QNN context handle and takes ownership (responsible for freeing via contextFree).
+  Ort::Status AddQnnContextHandle(Qnn_ContextHandle_t context_handle);
+
+  // Reads a context binary file into a buffer. Validates the file exists and is non-empty.
+  // Shared between LoadCachedQnnContextFromBuffer and RecoverFromSSR to avoid duplicating
+  // file I/O logic. If io_dispatch is non-null and carries a read callback, the
+  // callback is dispatched instead of reading from disk.
+  Ort::Status ReadContextBinIfValid(const std::string& context_bin_filepath,
+                                    std::vector<char>& buffer,
+                                    const qnn::EpContextIoDispatch& io_dispatch);
+
+  // Reloads a QNN context from its binary file after an SSR event. Handles both file-mapped
+  // and direct-read paths to match initial-load behavior. Always starts a new spill-fill
+  // group (firstGroupHandle = 0x0) since SSR invalidates all prior context handles.
+  // The new context handle is registered via AddQnnContextHandle on success.
+  Ort::Status ReloadContextForSSR(const std::string& context_bin_filepath,
+                                  int64_t max_spill_fill_size,
+                                  Qnn_ContextHandle_t& new_context,
+                                  const qnn::EpContextIoDispatch& io_dispatch = qnn::EpContextIoDispatch(nullptr));
+
+  // Builds the common context configs (priority + spill-fill) used by both binary-load paths.
+  // first_group_handle: 0x0 for SSR (always a new group); GetQnnContext(0) for initial multi-
+  // context load (joins the existing spill-fill group).
+  // Adding a new config here propagates to both LoadCachedQnnContextFromBuffer and ReloadContextForSSR.
+  Ort::Status BuildContextBinaryConfigs(
+      int64_t max_spill_fill_size,
+      Qnn_ContextHandle_t first_group_handle,
+      QnnConfigsBuilder<QnnContext_Config_t, QnnHtpContext_CustomConfig_t>& configs_builder);
+
+  // Shared dispatch helper used by ReloadContextForSSR and LoadCachedQnnContextFromBuffer.
+  // Attempts contextCreateFromBinaryWithCallback when use_file_mapping is true; falls back to
+  // contextCreateFromBinary on failure or when file mapping is disabled/unavailable.
+  // bin_buffer: pre-acquired mapped or pre-read buffer; pass nullptr to read from context_bin_filepath.
+  // Does NOT call AddQnnContextHandle — callers are responsible for registering the handle.
+  Ort::Status CreateContextHandleFromBinary(void* bin_buffer,
+                                            uint64_t buffer_length,
+                                            bool use_file_mapping,
+                                            const QnnContext_Config_t** context_configs,
+                                            const std::string& context_bin_filepath,
+                                            const qnn::EpContextIoDispatch& io_dispatch,
+                                            Qnn_ProfileHandle_t profile_handle,
+                                            Qnn_ContextHandle_t& context);
+
+  // Returns true if the given context handle is still tracked (not yet freed).
+  bool HasContextHandle(Qnn_ContextHandle_t context_handle) const {
+    return context_map_.find(context_handle) != context_map_.end();
+  }
+
+  // Returns the mutex that serializes SSR context recovery across models sharing this backend.
+  std::mutex& GetContextRecoveryMutex() { return context_recovery_mutex_; }
+
+  // Initializes handles to QNN resources (device, logger, etc.).
+  // NOTE: This function locks the internal `logger_recursive_mutex_`.
+  Ort::Status SetupBackend(
+      bool load_from_cached_context,
+      bool need_load_system_lib,
+      bool share_ep_contexts,
+      int htp_share_resource_optimization,
+      bool enable_file_mapped_weights,
+      std::shared_ptr<qnn::RpcMemLibrary> rpcmem_library,
+      std::unordered_map<std::string, std::unique_ptr<std::vector<std::string>>>& context_bin_map,
+      // Defaults to a no-callback dispatch so callers that have nothing to do with EPContext
+      // encryption (e.g. compatibility probes) don't have to construct and pass a dummy.
+      const qnn::EpContextIoDispatch& io_dispatch = qnn::EpContextIoDispatch(nullptr),
+      bool enable_htp_extended_udma_mode = false,
+      bool enable_htp_prepare_only = false,
+      bool enable_htp_graph_splitting = false,
+      uint32_t htp_graph_splitting_num_prepare_threads = UINT32_MAX);
+
+  // Below functions are especially for multi-SoC EP context scenarios.
+  Ort::Status SetupBackendExceptDeviceAndContext();
+
+  Ort::Status SetupDeviceAndContext(QnnHtpDevice_Arch_t htp_arch,
+                                    uint32_t soc_model,
+                                    bool enable_htp_extended_udma_mode = false,
+                                    bool enable_htp_prepare_only = false,
+                                    bool enable_htp_ref_weight_sharing = false,
+                                    bool enable_htp_graph_splitting = false,
+                                    uint32_t htp_graph_splitting_num_prepare_threads = UINT32_MAX);
+
+  void ReleaseDeviceAndContext();
+
+  Ort::Status AddContextToDlc();
+  // End of multi-SoC EP context specific usage.
+
+  Ort::Status CreateHtpPowerCfgId(uint32_t deviceId, uint32_t coreId, uint32_t& htp_power_config_id);
+
+  Ort::Status InitializePowerCfgId(uint32_t deviceId, uint32_t coreId, uint32_t& htp_power_config_id);
+
+  void DeInitializePerfTimer();
+
+  // Drops a per-session power-config id from the release timer's boosted set.
+  // Call before destroying the id when the (possibly shared) timer may still be
+  // live, so it will not relax a destroyed id.
+  void DropBoostedPowerConfigId(uint32_t htp_power_config_id);
+
+  Ort::Status DestroyHtpPowerConfigId(uint32_t htp_power_config_id);
+
+  Ort::Status SetPerThreadHtpPowerConfigs(const std::thread::id& thread_id, bool pre_run);
+
+  Ort::Status AddPerThreadHtpPowerConfigMapping(const std::thread::id& thread_id,
+                                                const PerThreadHtpPowerConfigs_t& htp_power_configs);
+
+  void RemovePerThreadHtpPowerConfigMapping(const std::thread::id& thread_id);
+
+  const QNN_INTERFACE_VER_TYPE& GetQnnInterface() const { return qnn_interface_; }
+
+  const QNN_INTERFACE_VER_TYPE& GetQnnValidatorInterface() const { return qnn_validator_interface_; }
+
+  const QNN_SYSTEM_INTERFACE_VER_TYPE& GetQnnSystemInterface() const { return qnn_sys_interface_; }
+
+  const Qnn_ContextHandle_t& GetQnnContext(int index = 0) {
+    if (!((contexts_.size() > 0) && (static_cast<size_t>(index) < contexts_.size()))) {
+      ORT_CXX_API_THROW("No valid QNN context!", ORT_EP_FAIL);
+    }
+    return contexts_[index];
+  }
+
+  size_t GetQnnContextSize() {
+    return contexts_.size();
+  }
+
+  const Qnn_BackendHandle_t& GetQnnBackendHandle() const { return backend_handle_; }
+
+  const Qnn_BackendHandle_t& GetQnnValidatorBackendHandle() const { return validator_backend_handle_; }
+
+  const Qnn_DeviceHandle_t& GetQnnDeviceHandle() const { return device_handle_; }
+
+  // Resets the QNN log level to the given ORT log level or to the default log level if the argument is
+  // std::nullopt.
+  // NOTE: This function locks the internal `logger_recursive_mutex_`.
+  Ort::Status ResetQnnLogLevel(std::optional<OrtLoggingLevel> ort_log_level = std::nullopt);
+
+  uint32_t GetBackendId() { return backend_id_; }
+
+  void SetQnnBackendType(uint32_t backend_id);
+  QnnBackendType GetQnnBackendType() const { return qnn_backend_type_; }
+
+  void SetQnnAllocatorType(QnnAllocatorType allocator_type) { qnn_allocator_type_ = allocator_type; }
+  QnnAllocatorType GetQnnAllocatorType() const { return qnn_allocator_type_; }
+
+  Qnn_Version_t GetBackendApiVersion() { return backend_api_version_; }
+
+  const std::string& GetSdkVersion() { return sdk_build_version_; }
+
+  QnnHtpDevice_Arch_t GetHtpArch() const { return htp_arch_internal_; }
+
+  uint32_t GetSocModel() const { return soc_model_; }
+
+  uint32_t GetVtcmSize() const { return vtcm_size_internal_; }
+
+  // Get backend library directory by adopting identical logic as in LoadLib.
+  std::string GetBackendLibDir() {
+    auto backend_path = std::filesystem::path(backend_path_);
+    if (backend_path.is_absolute()) {
+      return backend_path.parent_path().string();
+    }
+
+    auto abs_backend_path = std::filesystem::path(OrtGetRuntimePath()) / backend_path_;
+    return std::filesystem::exists(abs_backend_path) ? abs_backend_path.parent_path().string()
+                                                     : backend_path.parent_path().string();
+  }
+
+  Ort::Status GetMaxSpillFillBufferSize(unsigned char* buffer,
+                                        uint64_t buffer_length,
+                                        bool is_multi_soc_buffer,
+                                        uint64_t& max_spill_fill_buffer_size);
+
+  // Gets an existing QNN mem handle or registers a new one.
+  // `mem_handle` is set to the QNN mem handle.
+  Ort::Status GetOrRegisterContextMemHandle(Qnn_ContextHandle_t context, void* shared_memory_address,
+                                            const Qnn_Tensor_t& qnn_tensor,
+                                            Qnn_MemHandle_t& mem_handle);
+
+  Ort::Status ParseLoraConfig(std::string lora_config);
+
+  QnnSerializerConfig* GetQnnSerializerConfig();
+
+  // Handler to be called upon successful context creation via contextCreateFromBinaryListAsync()
+  // This handler is expected to be called in the callback ContextCreateAsyncCallback() in the .cc file
+  // Takes in the context and the notifyParam objects received by the callback function
+  // notifyParam is expected to be a pointer to a vector of node names associated with that context handle
+  // For each node name, a mapping to the context handle will be created
+  void ProcessContextFromBinListAsync(Qnn_ContextHandle_t handle, void* notifyParam);
+
+  // Sets the context priority to the given value, if valid
+  Ort::Status SetContextPriority(ContextPriority context_priority);
+  // Resets the context priority to the session default as defined by context_priority_
+  Ort::Status ResetContextPriority();
+
+  QnnBackendProfilingManager& GetProfilingManager() { return *profiling_manager_; }
+  const QnnBackendProfilingManager& GetProfilingManager() const { return *profiling_manager_; }
+  bool IsBackendSetup() { return backend_setup_completed_; }
+
+  bool FileMappingIsEnabled() {
+    return file_mapped_weights_enabled_;
+  }
+
+  // Note that whether in host mode is meaningless if not on device.
+  bool IsBackendHostMode() const { return configure_host_mode_; }
+
+#ifdef QNN_FILE_MAPPED_WEIGHTS_AVAILABLE
+  Qnn_ErrorHandle_t MapDmaData(Qnn_ContextBinaryDataRequest_t request,
+                               Qnn_ContextBinaryDmaDataResponse_t* response,
+                               void* const mapped_base_ptr,
+                               const size_t file_size);
+
+  Qnn_ErrorHandle_t ReleaseDmaData(Qnn_ContextBinaryDmaDataMem_t data_mem, void* mapped_base_ptr);
+#endif
+
+  // Releases all QNN resources. Called in the destructor.
+  // NOTE: This function indirectly locks the internal `logger_recursive_mutex_` via nested function calls.
+  void ReleaseResources();
+
+#ifdef QNN_FILE_MAPPED_WEIGHTS_AVAILABLE
+  typedef struct FileMappingCallbackInfo {
+    void* const mapped_file_ptr;
+    const size_t file_size;
+    QnnBackendManager* const backend_manager;
+
+    FileMappingCallbackInfo(void* ptr, size_t size, QnnBackendManager* manager)
+        : mapped_file_ptr(ptr), file_size(size), backend_manager(manager) {}
+
+  } FileMappingCallbackInfo_t;
+#endif
+
+  void ResetLogger(const Ort::Logger& logger) {
+    logger_ptr_ = &logger;
+  }
+
+  // Release the current QNN context handles (frees HW resources).
+  // Idempotent — safe to call even if no context is active.
+  Ort::Status ReleaseContext();
+
+  bool IsDx12SharedMemoryAllocatorSupported();
+
+  power::HtpPowerConfigManager& GetHtpPowerConfigManager() {
+    return htp_power_config_manager_;
+  }
+
+ private:
+  Ort::Status LoadBackend();
+
+  Ort::Status SetGlobalConfig();
+
+  // Shared implementation for InitializeBackend / InitializeValidatorBackend.
+  Ort::Status InitializeBackendCommon(const QNN_INTERFACE_VER_TYPE& interface,
+                                      Qnn_LogHandle_t log_handle,
+                                      Qnn_BackendHandle_t& backend_handle,
+                                      bool& initialized_flag,
+                                      const std::string& backend_label);
+
+  Ort::Status InitializeBackend(bool enable_gpu_weight_sharing = false);
+
+  Ort::Status InitializeValidatorBackend();
+
+  // Shared implementation for CreateDevice / CreateValidatorDevice.
+  // `allow_hw_device_enumeration` controls whether to honor `device_id_` and pass
+  // platform-info configs to deviceCreate. The validator backend is a host-side shim
+  // with no real hardware to enumerate, so it always passes false.
+  Ort::Status CreateDeviceCommon(const QNN_INTERFACE_VER_TYPE& interface,
+                                 Qnn_LogHandle_t log_handle,
+                                 Qnn_DeviceHandle_t& device_handle,
+                                 bool& device_created_flag,
+                                 bool allow_hw_device_enumeration);
+
+  Ort::Status CreateSystemDlcPlugin();
+
+  Ort::Status ReleaseSystemDlcPlugin();
+
+  Ort::Status CreateDevice();
+
+  Ort::Status CreateValidatorDevice();
+
+  // Shared implementation for ReleaseDevice / ReleaseValidatorDevice.
+  Ort::Status ReleaseDeviceCommon(const QNN_INTERFACE_VER_TYPE& interface,
+                                  Qnn_DeviceHandle_t& device_handle,
+                                  bool& device_created_flag);
+
+  Ort::Status ReleaseDevice();
+
+  Ort::Status ReleaseValidatorDevice();
+
+  // Shared implementation for ShutdownBackend / ShutdownValidatorBackend.
+  Ort::Status ShutdownBackendCommon(const QNN_INTERFACE_VER_TYPE& interface,
+                                    Qnn_BackendHandle_t& backend_handle,
+                                    bool& initialized_flag,
+                                    const std::string& backend_label);
+
+  Ort::Status ShutdownBackend();
+
+  Ort::Status ShutdownValidatorBackend();
+
+  Ort::Status CreateContext(bool enable_htp_weight_sharing,
+                            bool enable_htp_extended_udma_mode,
+                            bool enable_htp_prepare_only,
+                            bool enable_htp_ref_weight_sharing,
+                            bool enable_htp_graph_splitting = false,
+                            uint32_t htp_graph_splitting_num_prepare_threads = UINT32_MAX);
+
+  Ort::Status GetFileSizeIfValid(const std::string& filepath, size_t& file_size);
+
+  Ort::Status CreateContextVtcmBackupBufferSharingEnabled(std::unordered_map<std::string,
+                                                                             std::unique_ptr<std::vector<std::string>>>& context_bin_map,
+                                                          const qnn::EpContextIoDispatch& io_dispatch);
+
+  Ort::Status CreateContextFromListAsync(const QnnContext_Config_t** configs,
+                                         std::unordered_map<std::string,
+                                                            std::unique_ptr<std::vector<std::string>>>& context_bin_map,
+                                         const qnn::EpContextIoDispatch& io_dispatch);
+
+#ifdef QNN_FILE_MAPPED_WEIGHTS_AVAILABLE
+  Ort::Status CreateContextFromListAsyncWithCallback(const QnnContext_Config_t** configs,
+                                                     std::unordered_map<std::string,
+                                                                        std::unique_ptr<std::vector<std::string>>>& context_bin_map);
+#endif
+
+  // Shared implementation for InitializeQnnLog / InitializeQnnValidatorLog.
+  Ort::Status InitializeQnnLogCommon(const QNN_INTERFACE_VER_TYPE& interface,
+                                     Qnn_LogHandle_t& log_handle,
+                                     const std::string& backend_label);
+
+  // Creates a corresponding QNN logger with the same log level.
+  // NOTE: caller must lock the `logger_recursive_mutex_` before calling this function.
+  Ort::Status InitializeQnnLog();
+
+  Ort::Status InitializeQnnValidatorLog();
+
+  // Shared implementation for TerminateQnnLog calls.
+  // Resets log_handle to nullptr before returning, even on failure, so other threads
+  // waiting on logger_recursive_mutex_ can observe the handle is gone.
+  Ort::Status TerminateQnnLogCommon(const QNN_INTERFACE_VER_TYPE& interface,
+                                    Qnn_LogHandle_t& log_handle,
+                                    const std::string& backend_label);
+
+  Ort::Status SetQnnLogLevelCommon(const QNN_INTERFACE_VER_TYPE& interface,
+                                   Qnn_LogHandle_t log_handle,
+                                   QnnLog_Level_t qnn_log_level,
+                                   const std::string& label);
+
+  // Terminate logging in the backend
+  // NOTE: This function locks the internal `logger_recursive_mutex_`.
+  Ort::Status TerminateQnnLog();
+
+  void* LoadLib(const char* file_name, int flags, std::string& error_msg);
+
+  Ort::Status LoadQnnSystemLib();
+
+  Ort::Status LoadQnnSerializerBackend();
+
+  Ort::Status UnloadLib(void* handle);
+
+  void* LibFunction(void* handle, const char* symbol, std::string& error_msg);
+
+  template <class T>
+  inline T ResolveSymbol(void* lib_handle, const char* sym, const Ort::Logger& logger) {
+    std::string error_msg = "";
+    T ptr = (T)LibFunction(lib_handle, sym, error_msg);
+    if (ptr == nullptr) {
+      ORT_CXX_LOG(
+          logger,
+          ORT_LOGGING_LEVEL_ERROR,
+          ("Unable to access symbol: " + std::string(sym) + ". error: " + error_msg).c_str());
+    }
+    return ptr;
+  }
+
+  template <typename F, class T>
+  Ort::Status GetQnnInterfaceProvider(const char* lib_path,
+                                      const char* interface_provider_name,
+                                      void** backend_lib_handle,
+                                      Qnn_Version_t req_version,
+                                      T** interface_provider);
+
+  bool IsDevicePropertySupported(const QNN_INTERFACE_VER_TYPE& interface);
+
+  std::string GetBackendBuildId() {
+    char* backend_build_id{nullptr};
+    if (QNN_SUCCESS != qnn_interface_.backendGetBuildId((const char**)&backend_build_id)) {
+      ORT_CXX_LOG_PTR(logger_ptr_, ORT_LOGGING_LEVEL_ERROR, "Unable to get build Id from the backend.");
+    }
+    return (backend_build_id == nullptr ? std::string("") : std::string(backend_build_id));
+  }
+
+  std::string QnnErrorHandleToString(Qnn_ErrorHandle_t error);
+  QnnLog_Level_t MapOrtSeverityToQNNLogLevel(OrtLoggingLevel ort_log_level);
+
+  bool GetPerThreadHtpPowerConfigMapping(const std::thread::id& thread_id,
+                                         PerThreadHtpPowerConfigs_t& htp_power_configs);
+
+  Ort::Status GetPlatformInfo();
+
+ private:
+  // assume Qnn_ContextHandle_t is a pointer and able to be wrapped with std::unique_ptr
+  static_assert(std::is_pointer_v<Qnn_ContextHandle_t>);
+  using UniqueQnnContextHandle =
+      std::unique_ptr<std::remove_pointer_t<Qnn_ContextHandle_t>, std::function<void(Qnn_ContextHandle_t)>>;
+
+  struct QnnContextHandleRecord {
+    UniqueQnnContextHandle context_handle;
+    std::unique_ptr<QnnContextMemHandleManager> mem_handles;
+  };
+
+  Ort::Status LoadOpPackage() {
+    // assume op_packages passed in represented in
+    // op_packages|<OpTpye>:<PackagePath>:<InterfaceSymbolName>:<OptionalTarget>,<OpTpye2>:<PackagePath2>:<InterfaceSymbolName2>:<OptionalTarget2>
+    for (const auto& op_package : op_packages_) {
+      RETURN_IF(nullptr == qnn_interface_.backendRegisterOpPackage, "backendRegisterOpPackageFnHandle is nullptr.");
+
+      Qnn_ErrorHandle_t result = qnn_interface_.backendRegisterOpPackage(
+          backend_handle_,
+          op_package.path.c_str(),
+          op_package.interface.c_str(),
+          op_package.target.c_str());
+
+      if (result != QNN_SUCCESS) {
+        switch (result) {
+          case QNN_BACKEND_ERROR_INVALID_ARGUMENT:
+            ORT_CXX_LOG_PTR(logger_ptr_,
+                            ORT_LOGGING_LEVEL_ERROR,
+                            "Invalid argument, please check if op package path or interface provider is NULL.");
+            break;
+          case QNN_BACKEND_ERROR_OP_PACKAGE_NOT_FOUND:
+            ORT_CXX_LOG_PTR(logger_ptr_,
+                            ORT_LOGGING_LEVEL_ERROR,
+                            ("Could not open op package path. op_pack_path: " + op_package.path).c_str());
+            break;
+          case QNN_BACKEND_ERROR_OP_PACKAGE_IF_PROVIDER_NOT_FOUND:
+            ORT_CXX_LOG_PTR(logger_ptr_,
+                            ORT_LOGGING_LEVEL_ERROR,
+                            "Could not find interfaceProvider symbol in op package library.");
+            break;
+          case QNN_BACKEND_ERROR_OP_PACKAGE_REGISTRATION_FAILED:
+            ORT_CXX_LOG_PTR(logger_ptr_, ORT_LOGGING_LEVEL_ERROR, "Op package registration failed.");
+            break;
+          case QNN_BACKEND_ERROR_OP_PACKAGE_UNSUPPORTED_VERSION:
+            ORT_CXX_LOG_PTR(logger_ptr_,
+                            ORT_LOGGING_LEVEL_ERROR,
+                            "Op package has interface version not supported by this backend.");
+            break;
+          case QNN_BACKEND_ERROR_NOT_SUPPORTED:
+            ORT_CXX_LOG_PTR(logger_ptr_, ORT_LOGGING_LEVEL_ERROR, "Op package registration is not supported.");
+            break;
+          case QNN_BACKEND_ERROR_INVALID_HANDLE:
+            ORT_CXX_LOG_PTR(logger_ptr_, ORT_LOGGING_LEVEL_ERROR, "backend is not a valid handle.");
+            break;
+          case QNN_BACKEND_ERROR_OP_PACKAGE_DUPLICATE:
+            ORT_CXX_LOG_PTR(logger_ptr_,
+                            ORT_LOGGING_LEVEL_ERROR,
+                            "OpPackageName+OpName must be unique. Op package content information can be be obtained with"
+                            "QnnOpPackage interface. Indicates that an Op with the same package name and op name was"
+                            "already registered.");
+            break;
+          case QNN_COMMON_ERROR_SYSTEM_COMMUNICATION:
+            ORT_CXX_LOG_PTR(logger_ptr_, ORT_LOGGING_LEVEL_ERROR, "SSR occurrence (successful recovery).");
+            break;
+          case QNN_COMMON_ERROR_SYSTEM_COMMUNICATION_FATAL:
+            ORT_CXX_LOG_PTR(logger_ptr_, ORT_LOGGING_LEVEL_ERROR, "SSR occurrence (unsuccessful recovery).");
+            break;
+          default:
+            ORT_CXX_LOG_PTR(logger_ptr_,
+                            ORT_LOGGING_LEVEL_ERROR,
+                            "Unknown error occurred while initializing logging in the QNN backend.");
+            break;
+        }
+      }
+      RETURN_IF(QNN_SUCCESS != result,
+                ("Failed to register op package to backend. Error: " + QnnErrorHandleToString(result)).c_str());
+      ORT_CXX_LOG_PTR(logger_ptr_, ORT_LOGGING_LEVEL_ERROR, "Successfully register the op package.");
+      std::string op_package_for_registration = op_package.interface;
+      std::string suffix = "InterfaceProvider";
+      if (op_package_for_registration.size() >= suffix.size() &&
+          op_package_for_registration.compare(op_package_for_registration.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        op_package_for_registration.erase(op_package_for_registration.size() - suffix.size());
+      }
+      registerUDO(op_package.op_type, op_package_for_registration);
+    }
+
+    return Ort::Status();
+  }
+
+  std::unique_ptr<void, std::function<void(void*)>> GetSystemContextHandle();
+
+  Ort::Status GetGraphInfoAndBinVersion(QnnSystemContext_Handle_t sys_ctx_handle,
+                                        void* buffer,
+                                        Qnn_ContextBinarySize_t buffer_length,
+                                        Qnn_Version_t& blob_version,
+                                        uint32_t& graph_count,
+                                        QnnSystemContext_GraphInfo_t** graphs_info);
+
+  void InitializeProfilingManager(const QnnBackendManagerConfig& config);
+
+  // Checks if act_ver is >= min_ver. An act_ver of 0.0.0 is considered invalid.
+  static bool MinVersionMet(const Qnn_Version_t& act_ver, const Qnn_Version_t& min_ver) {
+    if (act_ver.major == 0 && act_ver.minor == 0 && act_ver.patch == 0) {
+      return false;
+    }
+
+    return act_ver.major > min_ver.major ||
+           (act_ver.major == min_ver.major && act_ver.minor > min_ver.minor) ||
+           (act_ver.major == min_ver.major && act_ver.minor == min_ver.minor && act_ver.patch >= min_ver.patch);
+  }
+
+  const std::string backend_path_;
+  std::recursive_mutex logger_recursive_mutex_;
+  QNN_INTERFACE_VER_TYPE qnn_interface_ = QNN_INTERFACE_VER_TYPE_INIT;
+  // Invariant: qnn_validator_interface_ and validator_backend_handle_ are always set together
+  // by LoadQnnSerializerBackend() (serializer flow: QnnIr). Both remain zero/null in all other flows.
+  // QnnModelWrapper::ValidateQnnNode() uses validator_backend_handle_ != nullptr as the sole signal
+  // to route backendValidateOpConfig to the validator interface rather than qnn_interface_.
+  QNN_INTERFACE_VER_TYPE qnn_validator_interface_ = QNN_INTERFACE_VER_TYPE_INIT;
+  QNN_SYSTEM_INTERFACE_VER_TYPE qnn_sys_interface_ = QNN_SYSTEM_INTERFACE_VER_TYPE_INIT;
+  void* backend_lib_handle_ = nullptr;
+  void* validator_backend_lib_handle_ = nullptr;
+  void* system_lib_handle_ = nullptr;
+  Qnn_BackendHandle_t backend_handle_ = nullptr;
+  Qnn_BackendHandle_t validator_backend_handle_ = nullptr;
+  QnnBackend_Config_t** backend_config_ = nullptr;
+  // GPU backend weight sharing config (valid only when GPU backend is active, lifetime: owned by this class)
+  QnnGpuBackend_CustomConfig_t gpu_backend_custom_config_{};
+  QnnBackend_Config_t backend_config_wrapper_{};
+  QnnBackend_Config_t* backend_configs_ptr_[2]{nullptr, nullptr};
+  Qnn_LogHandle_t log_handle_ = nullptr;
+  Qnn_LogHandle_t validator_log_handle_ = nullptr;
+  Qnn_DeviceHandle_t device_handle_ = nullptr;
+  Qnn_DeviceHandle_t validator_device_handle_ = nullptr;
+
+  // Map of Qnn_ContextHandle_t to QnnContextHandleRecord.
+  // The QnnContextHandleRecord has ownership of the Qnn_ContextHandle_t.
+  // Note: Using shared_ptr<QnnContextHandleRecord> so that we can refer to it with a weak_ptr from a
+  // HtpSharedMemoryAllocator allocation cleanup callback.
+  std::unordered_map<Qnn_ContextHandle_t, std::shared_ptr<QnnContextHandleRecord>> context_map_;
+
+  // Serializes the check → release → create → register sequence in RecoverFromSSR().
+  // In weight-sharing scenarios multiple QnnModel instances may detect an SSR event
+  // simultaneously and call RecoverFromSSR() concurrently.  Without this mutex the
+  // first-model-wins check (HasContextHandle) is racy: both models see the stale handle,
+  // both release it (double-free), or one reads a null context mid-recovery.
+  std::mutex context_recovery_mutex_;
+
+  // Map of EP Main Context Node names to Qnn_ContextHandle_t
+  std::mutex ep_context_handle_map_mutex_;
+  std::unordered_map<std::string, Qnn_ContextHandle_t> ep_context_handle_map_;
+
+  // Vector of Qnn_ContextHandle_t. The context handles are owned by context_map_.
+  std::vector<Qnn_ContextHandle_t> contexts_;
+
+  bool backend_lib_loaded_ = false;
+  bool system_lib_loaded_ = false;
+
+  bool backend_initialized_ = false;
+  bool validator_backend_initialized_ = false;
+  bool device_created_ = false;
+  bool validator_device_created_ = false;
+  bool context_created_ = false;
+  bool backend_setup_completed_ = false;
+  bool backend_partial_setup_completed_ = false;  // For SetupBackendExceptDeviceAndContext and SetupDeviceAndContext.
+  int htp_share_resource_optimization_ = -1;
+  uint64_t reused_io_limit_mb_ = 0;
+
+  uint32_t backend_id_ = QNN_BACKEND_ID_CPU;
+  Qnn_Version_t core_api_version_ = QNN_VERSION_INIT;
+  Qnn_Version_t backend_api_version_ = QNN_VERSION_INIT;
+  bool file_mapped_weights_enabled_ = false;
+
+#ifdef QNN_FILE_MAPPED_WEIGHTS_AVAILABLE
+  std::unique_ptr<FileMappingInterface> file_mapper_ = nullptr;
+  // Notify params for file mapping must persist throughout lifetime of
+  // QnnBackendManager for release of DMA data callback on destruction
+  std::vector<std::unique_ptr<FileMappingCallbackInfo_t>> file_mapping_notify_params_;
+#endif
+
+  // NPU backend requires quantized model
+  QnnBackendType qnn_backend_type_ = QnnBackendType::CPU;
+  QnnAllocatorType qnn_allocator_type_ = QnnAllocatorType::NONE;
+  std::optional<bool> dx12_shared_memory_allocator_supported_ = std::nullopt;
+  std::unique_ptr<QnnBackendProfilingManager> profiling_manager_;
+  ContextPriority context_priority_;
+  std::string sdk_build_version_ = "";
+#ifdef _WIN32
+  std::set<HMODULE> mod_handles_;
+#endif
+  const std::shared_ptr<QnnSerializerConfig> qnn_serializer_config_;
+  uint32_t device_id_ = 0;
+  uint32_t htp_num_cores_ = 0;
+  QnnHtpDevice_Arch_t htp_arch_ = QNN_HTP_DEVICE_ARCH_NONE;
+  uint32_t soc_model_ = QNN_SOC_MODEL_UNKNOWN;
+  const std::vector<OpPackage> op_packages_;
+  bool skip_qnn_version_check_ = false;
+  // When true, skip wiring up the target-backend validator during DLC dump so that
+  // op validation falls back to the serializer's generic checks (see SetupBackend).
+  bool skip_backend_op_validation_ = false;
+  bool configure_host_mode_ = false;
+
+  power::HtpPowerConfigManager htp_power_config_manager_;
+
+  // Mapping of thread id to on-run-start/end power configs
+  std::mutex per_thread_power_configs_mutex_;
+  std::unordered_map<std::thread::id, PerThreadHtpPowerConfigs_t> per_thread_power_configs_;
+
+  // Internal holders to differentiate with user-provided ones.
+  // They should be acquired in GetPlatformInfo from SetupBackend during runtime (i.e., ARM64 platforms).
+  // On x86 platforms, they are set to user-provided ones (e.g., htp_arch_).
+  QnnHtpDevice_Arch_t htp_arch_internal_ = QNN_HTP_DEVICE_ARCH_NONE;
+  uint32_t vtcm_size_internal_ = 0;
+
+  // File mapping.
+  std::shared_ptr<RpcMemLibrary> rpcmem_library_ = nullptr;
+
+  // Backend plugin for system DLC APIs.
+  bool system_dlc_created_ = false;
+  std::shared_ptr<QnnBackendSystemDlcPlugin> system_dlc_plugin_ = nullptr;
+
+  const ApiPtrs api_ptrs_;
+  const Ort::Logger* logger_ptr_;
+};
+
+}  // namespace qnn
+}  // namespace onnxruntime

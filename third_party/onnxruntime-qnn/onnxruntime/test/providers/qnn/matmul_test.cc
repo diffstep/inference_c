@@ -1,0 +1,1041 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#include "qnn_test_utils.h"
+#if !defined(ORT_MINIMAL_BUILD)
+
+#include <filesystem>
+#include <string>
+#include <unordered_map>
+
+#include "test/providers/qnn/qnn_node_group/qnn_graph_checker.h"
+#include "test/providers/qnn/qnn_test_utils.h"
+
+#include "gtest/gtest.h"
+
+namespace onnxruntime {
+namespace test {
+
+// Returns a function that creates a graph with MatMul operator.
+static GetTestModelFn BuildMatMulOpTestCase(const TestInputDef<float>& input1_def,
+                                            const TestInputDef<float>& input2_def) {
+  return [input1_def, input2_def](ModelTestBuilder& builder) {
+    MakeTestInput<float>(builder, "input0", input1_def);
+    MakeTestInput<float>(builder, "input1", input2_def);
+
+    builder.MakeOutput("Y");
+
+    builder.AddNode("MatMul",
+                    "MatMul",
+                    {"input0", "input1"},
+                    {"Y"},
+                    kOnnxDomain);
+  };
+}
+
+static void RunMatMulOpTest(const std::vector<int64_t>& shape_0,
+                            const std::vector<int64_t>& shape_1, bool is_initializer_0, bool is_initializer_1,
+                            ExpectedEPNodeAssignment expected_ep_assignment = ExpectedEPNodeAssignment::All,
+                            const std::string& backend_name = "cpu",
+                            int opset = 18, float f32_abs_err = 1e-4f) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = backend_name;
+  provider_options["offload_graph_io_quantization"] = "0";
+
+  RunQnnModelTest(BuildMatMulOpTestCase(
+                      TestInputDef<float>(shape_0, is_initializer_0, GetSequentialFloatData(shape_0, 0.01f, 0.02f)),
+                      TestInputDef<float>(shape_1, is_initializer_1, GetSequentialFloatData(shape_1, 0.02f, 0.02f))),
+                  provider_options,
+                  opset,
+                  EPVerificationParams{expected_ep_assignment, ElementwiseAbsoluteVerifier(f32_abs_err)});
+}
+
+// Returns a function that creates a graph with a QDQ MatMul operator.
+template <typename Input0QType, typename Input1QType, typename OutputQType>
+static GetTestQDQModelFn<OutputQType> BuildMatMulOpQDQTestCase(const TestInputDef<float>& input0_def,
+                                                               const TestInputDef<float>& input1_def,
+                                                               bool use_contrib_qdq) {
+  return [input0_def, input1_def, use_contrib_qdq](ModelTestBuilder& builder,
+                                                   std::vector<QuantParams<OutputQType>>& output_qparams) {
+    // inputs
+    MakeTestInput<float>(builder, "input0", input0_def);
+    MakeTestInput<float>(builder, "input1", input1_def);
+
+    // input0 -> Q -> DQ -> input0_qdq
+    const QuantParams<Input0QType> input0_qparams = GetTestInputQuantParams<Input0QType>(input0_def);
+    const std::string input0_qdq =
+        AddQDQNodePair<Input0QType>(builder, "qdq_in0", "input0",
+                                    input0_qparams.scale, input0_qparams.zero_point, use_contrib_qdq);
+
+    // input1 -> Q -> DQ -> input1_qdq
+    const QuantParams<Input1QType> input1_qparams = GetTestInputQuantParams<Input1QType>(input1_def);
+    const std::string input1_qdq =
+        AddQDQNodePair<Input1QType>(builder, "qdq_in1", "input1",
+                                    input1_qparams.scale, input1_qparams.zero_point, use_contrib_qdq);
+
+    // MatMul -> Y
+    builder.AddNode("MatMul",
+                    "MatMul",
+                    {input0_qdq, input1_qdq},
+                    {"Y"},
+                    kOnnxDomain);
+
+    // Y -> Q -> DQ -> (graph output)
+    AddQDQNodePairWithOutputAsGraphOutput<OutputQType>(builder,
+                                                       "qdq_out",
+                                                       "Y",
+                                                       output_qparams[0].scale,
+                                                       output_qparams[0].zero_point,
+                                                       use_contrib_qdq);
+  };
+}
+
+/// Returns a function that creates a graph with a per-channel (weights) QDQ MatMul operator.
+template <typename Input0QType, typename WeightQType, typename OutputQType>
+static GetTestQDQModelFn<OutputQType> BuildQDQPerChannelMatMulTestCase(const TestInputDef<float>& input_def,
+                                                                       const TestInputDef<float>& weights_def,
+                                                                       int64_t weight_quant_axis,
+                                                                       bool use_contrib_qdq = false) {
+  return [input_def, weights_def, weight_quant_axis, use_contrib_qdq](
+             ModelTestBuilder& builder, std::vector<QuantParams<OutputQType>>& output_qparams) {
+    QNN_ASSERT(weights_def.IsInitializer() && weights_def.IsRawData());
+
+    // input
+    MakeTestInput<float>(builder, "input", input_def);
+
+    // input -> Q/DQ -> input_qdq
+    const QuantParams<Input0QType> input_qparams = GetTestInputQuantParams<Input0QType>(input_def);
+    const std::string input_qdq =
+        AddQDQNodePair<Input0QType>(builder, "qdq_in", "input",
+                                    input_qparams.scale, input_qparams.zero_point, use_contrib_qdq);
+
+    // Quantized(weights) -> DQ ->
+    auto weight_shape = weights_def.GetShape();
+    std::vector<float> weight_scales;
+    std::vector<WeightQType> weight_zero_points;
+    int64_t pos_weight_quant_axis = weight_quant_axis;
+    if (pos_weight_quant_axis < 0) {
+      pos_weight_quant_axis += static_cast<int64_t>(weight_shape.size());
+    }
+
+    GetTestInputQuantParamsPerChannel<WeightQType>(weights_def, weight_scales, weight_zero_points,
+                                                   static_cast<size_t>(pos_weight_quant_axis), true);
+
+    std::vector<WeightQType> quantized_weights;
+    size_t num_weight_storage_elems = SizeOfShape(weight_shape);
+    if constexpr (std::is_same_v<WeightQType, Int4x2> || std::is_same_v<WeightQType, UInt4x2>) {
+      num_weight_storage_elems = Int4x2::CalcNumInt4Pairs(SizeOfShape(weight_shape));
+    }
+    quantized_weights.resize(num_weight_storage_elems);
+
+    QuantizeValues<float, WeightQType>(weights_def.GetRawData(), quantized_weights, weight_shape, weight_scales,
+                                       weight_zero_points, pos_weight_quant_axis);
+
+    builder.MakeInitializer<WeightQType>("weights", weights_def.GetShape(), quantized_weights);
+
+    // weights -> DQ -> weights_dq
+    builder.AddDequantizeLinearNode<WeightQType>(
+        "weights_dq",
+        "weights",
+        weight_scales,
+        weight_zero_points,
+        "weights_dq",
+        {builder.MakeScalarAttribute("axis", static_cast<int64_t>(weight_quant_axis))},
+        use_contrib_qdq);
+
+    // MatMul(input_qdq, weights_dq) -> Y
+    builder.AddNode("MatMul",
+                    "MatMul",
+                    {input_qdq, "weights_dq"},
+                    {"Y"},
+                    kOnnxDomain);
+
+    // Y -> Q -> DQ -> (graph output)
+    AddQDQNodePairWithOutputAsGraphOutput<OutputQType>(builder,
+                                                       "qdq_out",
+                                                       "Y",
+                                                       output_qparams[0].scale,
+                                                       output_qparams[0].zero_point,
+                                                       use_contrib_qdq);
+  };
+}
+
+template <typename Input0QType, typename Input1QType, typename OutputQType>
+static void RunQDQMatMulOpTest(const std::vector<int64_t>& shape_0, const std::vector<int64_t>& shape_1,
+                               bool is_initializer_0, bool is_initializer_1,
+                               ExpectedEPNodeAssignment expected_ep_assignment = ExpectedEPNodeAssignment::All,
+                               int opset = 21, bool use_contrib_qdq = false,
+                               QDQTolerance tolerance = QDQTolerance()) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+
+  TestInputDef<float> input0_def(
+      shape_0, is_initializer_0,
+      GetFloatDataInRange(-0.1f, 0.1f,
+                          static_cast<size_t>(std::accumulate(shape_0.begin(), shape_0.end(), static_cast<int64_t>(1),
+                                                              std::multiplies<int64_t>()))));
+  TestInputDef<float> input1_def(
+      shape_1, is_initializer_1,
+      GetFloatDataInRange(-0.1f, 0.1f,
+                          static_cast<size_t>(std::accumulate(shape_1.begin(), shape_1.end(), static_cast<int64_t>(1),
+                                                              std::multiplies<int64_t>()))));
+
+  TestQDQModelAccuracy(
+      BuildMatMulOpTestCase(input0_def, input1_def),
+      BuildMatMulOpQDQTestCase<Input0QType, Input1QType, OutputQType>(input0_def, input1_def, use_contrib_qdq),
+      provider_options, opset, expected_ep_assignment, tolerance);
+}
+
+template <typename InputQType, typename WeightQType, typename OutputQType>
+static void RunQDQPerChannelMatMulOpTest(
+    const std::vector<int64_t>& shape_input, const std::vector<int64_t>& shape_weight, int64_t weight_quant_axis,
+    QDQTolerance tolerance = QDQTolerance(),
+    ExpectedEPNodeAssignment expected_ep_assignment = ExpectedEPNodeAssignment::All, int opset = 21,
+    bool use_contrib_qdq = false, bool enable_fp16_precision = true) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+
+  if (enable_fp16_precision) {
+#if defined(_WIN32)
+    SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+#endif
+#if defined(__linux__) && !defined(__aarch64__)
+    provider_options["soc_model"] = std::to_string(QNN_SOC_MODEL_SM8850);
+#endif
+    provider_options["enable_htp_fp16_precision"] = "1";
+  } else {
+    provider_options["enable_htp_fp16_precision"] = "0";
+  }
+
+  TestInputDef<float> input_def(
+      shape_input, false,
+      GetFloatDataInRange(-0.1f, 0.1f,
+                          static_cast<size_t>(std::accumulate(shape_input.begin(), shape_input.end(),
+                                                              static_cast<int64_t>(1), std::multiplies<int64_t>()))));
+  TestInputDef<float> weight_def(
+      shape_weight, true,
+      GetFloatDataInRange(-0.1f, 0.1f,
+                          static_cast<size_t>(std::accumulate(shape_weight.begin(), shape_weight.end(),
+                                                              static_cast<int64_t>(1), std::multiplies<int64_t>()))));
+
+  TestQDQModelAccuracy(BuildMatMulOpTestCase(input_def, weight_def),
+                       BuildQDQPerChannelMatMulTestCase<InputQType, WeightQType, OutputQType>(
+                           input_def, weight_def, weight_quant_axis, use_contrib_qdq),
+                       provider_options, opset, expected_ep_assignment, tolerance);
+}
+
+/// Returns a function that creates a graph with a block-quantized (BQ) weight MatMul operator.
+template <typename Input0QType, typename WeightQType, typename OutputQType>
+static GetTestQDQModelFn<OutputQType> BuildQDQBlockQuantMatMulTestCase(
+    const TestInputDef<float>& input_def,
+    const TestInputDef<float>& weights_def,
+    int64_t block_size,
+    int64_t weight_quant_axis,
+    bool use_contrib_qdq = false) {
+  return [input_def, weights_def, block_size, weight_quant_axis, use_contrib_qdq](
+             ModelTestBuilder& builder, std::vector<QuantParams<OutputQType>>& output_qparams) {
+    QNN_ASSERT(weights_def.IsInitializer() && weights_def.IsRawData());
+
+    // input -> Q/DQ -> input_qdq
+    MakeTestInput<float>(builder, "input", input_def);
+    const QuantParams<Input0QType> input_qparams = GetTestInputQuantParams<Input0QType>(input_def);
+    const std::string input_qdq = AddQDQNodePair<Input0QType>(
+        builder, "qdq_in", "input", input_qparams.scale, input_qparams.zero_point, use_contrib_qdq);
+
+    // Compute per-block quantization parameters (symmetric)
+    const auto& weight_shape = weights_def.GetShape();
+    int64_t pos_weight_quant_axis = weight_quant_axis;
+    if (pos_weight_quant_axis < 0) {
+      pos_weight_quant_axis += static_cast<int64_t>(weight_shape.size());
+    }
+
+    std::vector<float> weight_scales;
+    std::vector<WeightQType> weight_zero_points;
+    GetTestInputQuantParamsBlockQuant<WeightQType>(weights_def, weight_scales, weight_zero_points,
+                                                   block_size, pos_weight_quant_axis, true);
+
+    // Quantize weight data with per-block params
+    const size_t num_weight_elems = SizeOfShape(weight_shape);
+    size_t num_weight_storage_elems = num_weight_elems;
+    if constexpr (std::is_same_v<WeightQType, Int4x2> || std::is_same_v<WeightQType, UInt4x2>) {
+      num_weight_storage_elems = Int4x2::CalcNumInt4Pairs(num_weight_elems);
+    }
+    std::vector<WeightQType> quantized_weights(num_weight_storage_elems);
+    QuantizeValuesBlockQuant<float, WeightQType>(
+        weights_def.GetRawData(), quantized_weights, weight_shape,
+        weight_scales, weight_zero_points, block_size, pos_weight_quant_axis);
+
+    builder.MakeInitializer<WeightQType>("weights", weight_shape, quantized_weights);
+
+    // Compute 2D scale shape: [num_blocks, non_axis_dim] for axis=0
+    //                          [non_axis_dim, num_blocks] for axis=1
+    const int64_t axis_dim = weight_shape[static_cast<size_t>(pos_weight_quant_axis)];
+    const int64_t non_axis_dim = weight_shape[static_cast<size_t>(1 - pos_weight_quant_axis)];
+    const int64_t num_blocks = (axis_dim + block_size - 1) / block_size;
+    const std::vector<int64_t> scale_shape = (pos_weight_quant_axis == 0)
+                                                 ? std::vector<int64_t>{num_blocks, non_axis_dim}
+                                                 : std::vector<int64_t>{non_axis_dim, num_blocks};
+
+    builder.MakeInitializer<float>("weights_scale", scale_shape, weight_scales);
+    builder.MakeInitializer<WeightQType>("weights_zp", scale_shape, weight_zero_points);
+
+    // weights -> DQ -> weights_dq (with block_size and axis attributes)
+    builder.AddNode("weights_dq", "DequantizeLinear",
+                    {"weights", "weights_scale", "weights_zp"},
+                    {"weights_dq"},
+                    "",
+                    {builder.MakeScalarAttribute("axis", weight_quant_axis),
+                     builder.MakeScalarAttribute("block_size", block_size)});
+
+    // MatMul(input_qdq, weights_dq) -> Y
+    builder.AddNode("MatMul", "MatMul", {input_qdq, "weights_dq"}, {"Y"}, kOnnxDomain);
+
+    // Y -> Q -> DQ -> (graph output)
+    AddQDQNodePairWithOutputAsGraphOutput<OutputQType>(builder, "qdq_out", "Y",
+                                                       output_qparams[0].scale, output_qparams[0].zero_point,
+                                                       use_contrib_qdq);
+  };
+}
+
+template <typename InputQType, typename WeightQType, typename OutputQType>
+static void RunQDQBlockQuantMatMulOpTest(
+    const std::vector<int64_t>& shape_input,
+    const std::vector<int64_t>& shape_weight,
+    int64_t block_size,
+    int64_t weight_quant_axis,
+    QDQTolerance tolerance = QDQTolerance(),
+    ExpectedEPNodeAssignment expected_ep_assignment = ExpectedEPNodeAssignment::All,
+    int opset = 21,
+    bool use_contrib_qdq = false) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+  provider_options["enable_block_quant_weight_optimization"] = "1";
+
+  const size_t num_input_elems = static_cast<size_t>(
+      std::accumulate(shape_input.begin(), shape_input.end(), static_cast<int64_t>(1), std::multiplies<int64_t>()));
+  const size_t num_weight_elems = static_cast<size_t>(
+      std::accumulate(shape_weight.begin(), shape_weight.end(), static_cast<int64_t>(1), std::multiplies<int64_t>()));
+
+  TestInputDef<float> input_def(shape_input, false, GetFloatDataInRange(-0.1f, 0.1f, num_input_elems));
+  TestInputDef<float> weight_def(shape_weight, true, GetFloatDataInRange(-0.1f, 0.1f, num_weight_elems));
+
+  TestQDQModelAccuracy(
+      BuildMatMulOpTestCase(input_def, weight_def),
+      BuildQDQBlockQuantMatMulTestCase<InputQType, WeightQType, OutputQType>(
+          input_def, weight_def, block_size, weight_quant_axis, use_contrib_qdq),
+      provider_options, opset, expected_ep_assignment, tolerance);
+}
+
+//
+// CPU tests:
+//
+TEST_F(QnnCPUBackendTests, MatMulOp) {
+  // RunMatMulOpTest(shape_0, shape_1, is_initializer_0, is_initializer_1)
+  RunMatMulOpTest({2, 3}, {3, 2}, false, false);
+  RunMatMulOpTest({2, 3}, {3, 2}, false, true);
+  RunMatMulOpTest({2, 3}, {3, 2}, true, false);
+  RunMatMulOpTest({2, 3}, {3, 2}, true, true);  // constant folding
+  RunMatMulOpTest({2, 3}, {2, 3, 2}, false, false);
+  RunMatMulOpTest({3, 3, 3}, {3, 2}, true, false);
+  RunMatMulOpTest({2, 3, 3, 3}, {3, 2}, false, true);
+  RunMatMulOpTest({2, 3, 3, 3}, {2, 3, 3, 2}, false, true);
+
+  RunMatMulOpTest({2, 1, 2, 3}, {3, 3, 2}, false, false);
+  RunMatMulOpTest({3}, {3}, false, false);
+  RunMatMulOpTest({3}, {3}, false, true);
+  RunMatMulOpTest({3}, {3}, true, false);
+  RunMatMulOpTest({3}, {3, 2}, false, false);
+  RunMatMulOpTest({3}, {3, 2}, false, true);
+  RunMatMulOpTest({3}, {3, 3, 2}, true, false);
+  RunMatMulOpTest({2, 3}, {3}, false, false);
+  RunMatMulOpTest({2, 3}, {3}, true, false);
+  RunMatMulOpTest({2, 3, 4}, {4, 2}, false, true);
+  RunMatMulOpTest({2, 3, 3, 3}, {3}, false, false);
+  RunMatMulOpTest({1, 1, 2, 2, 4}, {4, 2}, false, true);
+
+  // Failed randomly on Linux
+  // Expected: contains 36 values, where each value and its corresponding value in 16-byte object
+  // <24-00 00-00 00-00 00-00 40-4A 47-42 4D-56 00-00> are an almost-equal pair
+  // Actual: 16-byte object <24-00 00-00 00-00 00-00 80-39 2B-42 4D-56 00-00>, where the value pair (0.104199991, 0)
+  // at index #18 don't match, which is -0.1042 from 0.1042
+  // RunMatMulOpTest({2, 3, 3, 3}, {3, 2}, true, false);
+}
+
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
+
+//
+// HTP tests:
+//
+
+namespace {
+
+// Builds an ONNX QDQ graph for a MatMul with a block-quantized (BW_FLOAT_BLOCK) weight.
+//   - activation A: float → Q(uint16) → DQ, shape [M, K]
+//   - weight B: INT4/INT8 (or UINT4/UINT8) initializer + DQ with block_size attribute and a rank-2
+//               float scale [K/block_size, N] (axis=0, K is the blocked contraction dimension)
+//   - output:  MatMul → Q(uint16) → DQ → graph output, shape [M, N]
+//
+// weight_bits: 4 for INT4/UINT4 (default), 8 for INT8/UINT8, 2 for INT2/UINT2.
+// block_size must be a multiple of 8 (4-bit), 4 (8-bit), or 16 (2-bit) per HTP.
+// weight_is_unsigned: true → use UINT weight type; exercises the unsigned→signed conversion path.
+GetQDQTestCaseFn BuildBQMatMulTestCase(int64_t M, int64_t K, int64_t N, int64_t block_size,
+                                       int weight_bits = 4, bool weight_is_unsigned = false,
+                                       std::vector<int64_t> act_shape_override = {},
+                                       std::vector<int64_t> weight_shape_override = {}) {
+  return [M, K, N, block_size, weight_bits, weight_is_unsigned, act_shape_override,
+          weight_shape_override](ModelTestBuilder& builder) -> void {
+    const int64_t num_blocks = K / block_size;  // caller ensures K % block_size == 0
+
+    // ── Activation A: float → Q(uint16) → DQ ─────────────────────────────────
+    const std::vector<int64_t> act_shape = act_shape_override.empty() ? std::vector<int64_t>{M, K}
+                                                                      : act_shape_override;
+    auto input_def = TestInputDef<float>(act_shape, false, -1.0f, 1.0f);
+    MakeTestInput<float>(builder, "input", input_def);
+
+    const float act_scale = 2.0f / 65534.0f;  // uint16 symmetric per-tensor, ~[-1, 1]
+    const uint16_t act_zp = 32767;
+    const std::string act_dql_out = AddQDQNodePair<uint16_t>(builder, "act", "input", act_scale, act_zp);
+
+    // ── Weight B initializer + DQ(block_size, axis=rank-2) ──────────────────
+    // Scale rank == weight rank per ONNX opset 21.
+    const std::vector<int64_t> weight_shape = weight_shape_override.empty()
+                                                  ? std::vector<int64_t>{K, N}
+                                                  : weight_shape_override;
+    // Build scale shape: same as weight shape with the K-axis (rank-2) replaced by num_blocks.
+    std::vector<int64_t> scale_shape = weight_shape;
+    scale_shape[scale_shape.size() - 2] = num_blocks;
+    const int64_t block_axis = static_cast<int64_t>(weight_shape.size()) - 2;
+    builder.MakeInitializer<float>("weight_scale", scale_shape, 0.01f, 0.05f);
+
+    const size_t num_elems = static_cast<size_t>(K * N);
+    if (weight_bits == 4 && !weight_is_unsigned) {
+      std::vector<Int4x2> weight_data(Int4x2::CalcNumInt4Pairs(num_elems));
+      for (size_t i = 0; i < num_elems; ++i) {
+        weight_data[i >> 1].SetElem(i & 1, static_cast<int8_t>((i % 7) - 3));
+      }
+      builder.MakeInitializer<Int4x2>("weight_quant", weight_shape, weight_data);
+    } else if (weight_bits == 4 && weight_is_unsigned) {
+      std::vector<UInt4x2> weight_data(UInt4x2::CalcNumInt4Pairs(num_elems));
+      for (size_t i = 0; i < num_elems; ++i) {
+        weight_data[i >> 1].SetElem(i & 1, static_cast<uint8_t>(i % 15));
+      }
+      builder.MakeInitializer<UInt4x2>("weight_quant", weight_shape, weight_data);
+    } else if (weight_bits == 2 && !weight_is_unsigned) {
+      std::vector<Int2x4> weight_data(Int2x4::CalcNumInt2Quads(num_elems));
+      for (size_t i = 0; i < num_elems; ++i) {
+        weight_data[i >> 2].SetElem(i & 3, static_cast<int8_t>((i % 3) - 1));
+      }
+      builder.MakeInitializer<Int2x4>("weight_quant", weight_shape, weight_data);
+    } else if (weight_bits == 2 && weight_is_unsigned) {
+      std::vector<UInt2x4> weight_data(UInt2x4::CalcNumInt2Quads(num_elems));
+      for (size_t i = 0; i < num_elems; ++i) {
+        weight_data[i >> 2].SetElem(i & 3, static_cast<uint8_t>(i % 4));
+      }
+      builder.MakeInitializer<UInt2x4>("weight_quant", weight_shape, weight_data);
+    } else if (weight_is_unsigned) {
+      std::vector<uint8_t> weight_data(num_elems);
+      for (size_t i = 0; i < num_elems; ++i) {
+        weight_data[i] = static_cast<uint8_t>(i % 127);
+      }
+      builder.MakeInitializer<uint8_t>("weight_quant", weight_shape, weight_data);
+    } else {
+      std::vector<int8_t> weight_data(num_elems);
+      for (size_t i = 0; i < num_elems; ++i) {
+        weight_data[i] = static_cast<int8_t>((i % 127) - 63);
+      }
+      builder.MakeInitializer<int8_t>("weight_quant", weight_shape, weight_data);
+    }
+
+    // DQ with block_size; omit zero_point (symmetric). axis=0: K is the blocked dimension.
+    builder.AddNode("weight_dql", "DequantizeLinear",
+                    {"weight_quant", "weight_scale"}, {"weight_dql_out"}, "",
+                    {builder.MakeScalarAttribute("axis", block_axis),
+                     builder.MakeScalarAttribute("block_size", block_size)});
+
+    // ── MatMul ───────────────────────────────────────────────────────────────
+    builder.AddNode("matmul", "MatMul", {act_dql_out, "weight_dql_out"}, {"matmul_out"}, kOnnxDomain);
+
+    // ── Output: MatMul → Q(uint16) → DQ → graph output ───────────────────────
+    const float out_scale = 4.0f / 65534.0f;
+    const uint16_t out_zp = 32767;
+    AddQDQNodePairWithOutputAsGraphOutput<uint16_t>(builder, "out", "matmul_out", out_scale, out_zp);
+  };
+}
+
+ProviderOptions GetBQMatMulProviderOptions() {
+  ProviderOptions opts;
+  opts["backend_type"] = "htp";
+  opts["offload_graph_io_quantization"] = "0";
+  opts["enable_block_quant_weight_optimization"] = "0";
+#if defined(__linux__) && !defined(__aarch64__)
+  // On the x86_64 Linux HTP simulator, specify SM8850 to enable BW_FLOAT_BLOCK support.
+  // On real ARM64 hardware, the SoC model is auto-detected by QNN EP.
+  opts["soc_model"] = std::to_string(QNN_SOC_MODEL_SM8850);
+#endif
+  return opts;
+}
+
+}  // namespace
+
+// INT4 weight, K=16, N=4, block_size=8 (2 blocks/N), uint16 activation, no bias.
+// Checks: all nodes assigned to QNN EP; output matches CPU EP within 1e-2.
+TEST_F(QnnHTPBackendTests, MatMulBQ_U16Int4_NoBias) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  RunQnnModelTest(BuildBQMatMulTestCase(/*M=*/2, /*K=*/16, /*N=*/4, /*block_size=*/8),
+                  GetBQMatMulProviderOptions(), /*opset=*/21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(1e-2f)});
+}
+
+// Larger K with more blocks per output channel. Guards the [num_blocks, N] → [N, num_blocks]
+// scale reordering: a wrong order fails on accuracy, not on QNN validation.
+TEST_F(QnnHTPBackendTests, MatMulBQ_U16Int4_MultiBlock) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  RunQnnModelTest(BuildBQMatMulTestCase(/*M=*/2, /*K=*/32, /*N=*/8, /*block_size=*/8),
+                  GetBQMatMulProviderOptions(), /*opset=*/21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(1e-2f)});
+}
+
+// INT4, block_size=16: still a valid HTP multiple-of-8 block size.
+TEST_F(QnnHTPBackendTests, MatMulBQ_U16Int4_BlockSize16) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  RunQnnModelTest(BuildBQMatMulTestCase(/*M=*/2, /*K=*/32, /*N=*/4, /*block_size=*/16),
+                  GetBQMatMulProviderOptions(), /*opset=*/21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(1e-2f)});
+}
+
+// INT8, block_size=4: minimum valid HTP multiple-of-4 block size for 8-bit.
+TEST_F(QnnHTPBackendTests, MatMulBQ_U16Int8_BlockSize4) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  RunQnnModelTest(BuildBQMatMulTestCase(/*M=*/2, /*K=*/16, /*N=*/4, /*block_size=*/4,
+                                        /*weight_bits=*/8),
+                  GetBQMatMulProviderOptions(), /*opset=*/21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(1e-2f)});
+}
+
+// UINT4 weight: exercises the unsigned→signed conversion path (TransformUnsignedToSignedFixedPoint).
+TEST_F(QnnHTPBackendTests, MatMulBQ_U16UInt4_NoBias) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  RunQnnModelTest(BuildBQMatMulTestCase(/*M=*/2, /*K=*/16, /*N=*/4, /*block_size=*/8,
+                                        /*weight_bits=*/4, /*weight_is_unsigned=*/true),
+                  GetBQMatMulProviderOptions(), /*opset=*/21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(2e-2f)});
+}
+
+// UINT8 weight: unsigned 8-bit path.
+TEST_F(QnnHTPBackendTests, MatMulBQ_U16UInt8_BlockSize4) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  RunQnnModelTest(BuildBQMatMulTestCase(/*M=*/2, /*K=*/16, /*N=*/4, /*block_size=*/4,
+                                        /*weight_bits=*/8, /*weight_is_unsigned=*/true),
+                  GetBQMatMulProviderOptions(), /*opset=*/21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(2e-2f)});
+}
+
+// INT2, block_size=16: DISABLED. Two independent blockers (same as Conv BQ):
+//   1. ORT CPU backend does not support 2-bit Q/DQ (rejects tensor(int2)).
+//   2. QAIRT HTP backend does not support 2-bit BQ until QAIRT 2.47.
+TEST_F(QnnHTPBackendTests, DISABLED_MatMulBQ_U16Int2_BlockSize16) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  RunQnnModelTest(BuildBQMatMulTestCase(/*M=*/2, /*K=*/32, /*N=*/4, /*block_size=*/16,
+                                        /*weight_bits=*/2),
+                  GetBQMatMulProviderOptions(), /*opset=*/21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(2e-2f)});
+}
+
+// Rank-3 activation [1, M, K]: leading dim=1, reshapes to [1, 1, M, K] matching weight [1, 1, K, N].
+TEST_F(QnnHTPBackendTests, MatMulBQ_U16Int4_Rank3Activation) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  RunQnnModelTest(BuildBQMatMulTestCase(/*M=*/2, /*K=*/16, /*N=*/4, /*block_size=*/8,
+                                        /*weight_bits=*/4, /*weight_is_unsigned=*/false,
+                                        /*act_shape_override=*/{1, 2, 16}),
+                  GetBQMatMulProviderOptions(), /*opset=*/21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(1e-2f)});
+}
+
+// Rank-3 weight [1, K, N]: leading dim = 1, reshapeable to [1, 1, K, N].
+TEST_F(QnnHTPBackendTests, MatMulBQ_U16Int4_Rank3Weight) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  RunQnnModelTest(BuildBQMatMulTestCase(/*M=*/2, /*K=*/16, /*N=*/4, /*block_size=*/8,
+                                        /*weight_bits=*/4, /*weight_is_unsigned=*/false,
+                                        /*act_shape_override=*/{}, /*weight_shape_override=*/{1, 16, 4}),
+                  GetBQMatMulProviderOptions(), /*opset=*/21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(1e-2f)});
+}
+
+// Rank-4 activation [1, 1, M, K]: already in 4-D form, no reshape needed.
+TEST_F(QnnHTPBackendTests, MatMulBQ_U16Int4_Rank4Activation) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  RunQnnModelTest(BuildBQMatMulTestCase(/*M=*/2, /*K=*/16, /*N=*/4, /*block_size=*/8,
+                                        /*weight_bits=*/4, /*weight_is_unsigned=*/false,
+                                        /*act_shape_override=*/{1, 1, 2, 16}),
+                  GetBQMatMulProviderOptions(), /*opset=*/21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(1e-2f)});
+}
+
+// Rank-4 weight [1, 1, K, N]: already in the [1,1,K,N] form QNN requires.
+TEST_F(QnnHTPBackendTests, MatMulBQ_U16Int4_Rank4Weight) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  RunQnnModelTest(BuildBQMatMulTestCase(/*M=*/2, /*K=*/16, /*N=*/4, /*block_size=*/8,
+                                        /*weight_bits=*/4, /*weight_is_unsigned=*/false,
+                                        /*act_shape_override=*/{}, /*weight_shape_override=*/{1, 1, 16, 4}),
+                  GetBQMatMulProviderOptions(), /*opset=*/21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(1e-2f)});
+}
+
+TEST_F(QnnHTPBackendTests, MatMulOp) {
+  // RunMatMulOpTest(shape_0, shape_1, is_initializer_0, is_initializer_1, expected_ep_assignment,
+  // opset, f32_abs_err)
+  RunMatMulOpTest({2, 3}, {3, 2}, false, false, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+  RunMatMulOpTest({2, 3}, {3, 2}, false, true, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+  RunMatMulOpTest({2, 3}, {3, 2}, true, false, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+  RunMatMulOpTest({2, 3}, {3, 2}, true, true, ExpectedEPNodeAssignment::All, "htp");  // constant folding
+  RunMatMulOpTest({2, 3}, {2, 3, 2}, false, false, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+  RunMatMulOpTest({2, 3, 3, 3}, {3, 2}, true, false, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+  RunMatMulOpTest({2, 3, 3, 3}, {3, 2}, false, true, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+  RunMatMulOpTest({2, 3, 3, 3}, {2, 3, 3, 2}, false, true, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+  RunMatMulOpTest({2, 1, 2, 3}, {3, 3, 2}, false, false, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+  RunMatMulOpTest({3}, {3}, false, false, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+  RunMatMulOpTest({3}, {3}, false, true, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+  RunMatMulOpTest({3}, {3}, true, false, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+  RunMatMulOpTest({3}, {3, 2}, false, false, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+  RunMatMulOpTest({3}, {3, 2}, false, true, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+  RunMatMulOpTest({3}, {3, 3, 2}, true, false, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+  RunMatMulOpTest({2, 3}, {3}, false, false, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+  RunMatMulOpTest({2, 3}, {3}, true, false, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+  RunMatMulOpTest({2, 3, 4}, {4, 2}, false, true, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+  RunMatMulOpTest({2, 3, 3, 3}, {3}, false, false, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+  RunMatMulOpTest({1, 1, 2, 2, 4}, {4, 2}, false, true, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+
+  // Failed randomly on Linux
+  // Expected: contains 18 values, where each value and its corresponding value in 16-byte object
+  // <12-00 00-00 00-00 00-00 40-3D CC-A5 5A-7A 00-00> are an almost-equal pair
+  // Actual: 16-byte object <12-00 00-00 00-00 00-00 80-E8 CF-8F 5B-7A 00-00>, where the value pair
+  // (0.0393999927, 98304.0078) at index #6 don't match, which is 98304 from 0.0394
+  // RunMatMulOpTest({3, 3, 3}, {3, 2}, true, false, ExpectedEPNodeAssignment::All, "htp", 18, 1e-2f);
+}
+
+// Broken on v79 and v81 devices with several results outside of acceptable tolerance.
+// Example:
+// Inaccuracy detected for output 'output_0', element 0
+// output_range=0.010000000707805157, tolerance=0.40000000596046448%.
+// Expected val (f32@CPU_EP): 0.010000000707805157
+// qdq@QNN_EP val: 0.0099215693771839142 (err: 7.8431330621242523e-05, err/output_range: 0.78431320190429688%)
+// qdq@CPU_EP val: 0.010000000707805157 (err: 0, err/output_range: 0%)
+// abs(qdq@QNN_EP - qdq@CPU_EP) / output_range = 0.78431320190429688%
+TEST_F(QnnHTPBackendTests, MatMulOp_QDQ) {
+  QNN_SKIP_TEST_ON_ARM64("QDQ accuracy below tolerance on v79 and v81 devices");
+  // UINT8
+  // RunQDQMatMulOpTest(shape_0, shape_1, is_initializer_0, is_initializer_1, expected_ep_assignment, opset,
+  // use_contrib_qdq)
+  RunQDQMatMulOpTest<uint8_t, uint8_t, uint8_t>({2, 3}, {3, 2}, false, false);
+  RunQDQMatMulOpTest<uint8_t, uint8_t, uint8_t>({2, 3}, {3, 2}, false, true, ExpectedEPNodeAssignment::All, 21,
+                                                false, QDQTolerance(0.008f));
+  RunQDQMatMulOpTest<uint8_t, uint8_t, uint8_t>({2, 2, 3}, {3, 2}, true, false, ExpectedEPNodeAssignment::All, 18,
+                                                true);
+  RunQDQMatMulOpTest<uint8_t, uint8_t, uint8_t>({2, 1, 3, 3}, {3, 3, 2}, false, true);
+  RunQDQMatMulOpTest<uint8_t, uint8_t, uint8_t>({3}, {3}, false, false);
+  RunQDQMatMulOpTest<uint8_t, uint8_t, uint8_t>({2, 3}, {3}, true, false);
+
+  // UINT16, UINT8
+  RunQDQMatMulOpTest<uint16_t, uint8_t, uint16_t>({2, 3}, {3, 2}, false, false);
+  RunQDQMatMulOpTest<uint16_t, uint8_t, uint16_t>({2, 3}, {3, 2}, false, true, ExpectedEPNodeAssignment::All, 18, true);
+  RunQDQMatMulOpTest<uint16_t, uint8_t, uint16_t>({2, 3, 3, 3}, {3, 2}, true, false);
+  RunQDQMatMulOpTest<uint16_t, uint8_t, uint16_t>({3}, {3, 2}, false, true);
+  RunQDQMatMulOpTest<uint16_t, uint8_t, uint16_t>({2, 3, 3, 3}, {3}, false, false);
+
+  // UINT16, per-channel signed 4-bit weight
+  // RunQDQPerChannelMatMulOpTest(shape_input, shape_weight, weight_quant_axis, tolerance, expected_ep_assignment,
+  // opset, use_contrib_qdq, enable_fp16_precision)
+  RunQDQPerChannelMatMulOpTest<uint16_t, Int4x2, uint16_t>({2, 3}, {3, 2}, 1);
+  RunQDQPerChannelMatMulOpTest<uint16_t, Int4x2, uint16_t>({2, 3, 3, 3}, {3, 2}, -1, QDQTolerance(),
+                                                           ExpectedEPNodeAssignment::All, 18, true);
+
+  // UINT16, per-channel INT8 weight
+  RunQDQPerChannelMatMulOpTest<uint16_t, int8_t, uint16_t>({2, 3}, {3, 2}, 1, QDQTolerance(),
+                                                           ExpectedEPNodeAssignment::All, 21, false, false);
+  RunQDQPerChannelMatMulOpTest<uint16_t, int8_t, uint16_t>({2, 3, 3}, {3}, -1, QDQTolerance(0.0041f));
+}
+
+// Tests MatMul with two uint16 (quantized) inputs that are both dynamic.
+// This exercises a logic in QNN EP that inserts a QNN Convert op before input[1] to convert asymmetric uint16 into
+// symmetric one.
+// Got specific shapes and input ranges (quant params) from customer model.
+TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_Regression_uint16_dynamic_inputs) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+#ifdef __linux__
+  // W16A16 requires minimum HTP arch v73.
+  provider_options["htp_arch"] = "73";
+#endif
+
+  // Test with rank 4 inputs
+  {
+    std::vector<int64_t> shape_0 = {1, 12, 512, 96};
+    TestInputDef<float> input0_def(
+        {1, 12, 512, 96}, false,
+        GetFloatDataInRange(-5.087f, 4.992f,
+                            static_cast<size_t>(std::accumulate(shape_0.begin(), shape_0.end(), static_cast<int64_t>(1),
+                                                                std::multiplies<int64_t>()))));
+    std::vector<int64_t> shape_1 = {1, 12, 96, 512};
+    TestInputDef<float> input1_def(
+        shape_1, false,
+        GetFloatDataInRange(-6.772f, 7.258f,
+                            static_cast<size_t>(std::accumulate(shape_1.begin(), shape_1.end(), static_cast<int64_t>(1),
+                                                                std::multiplies<int64_t>()))));
+
+    TestQDQModelAccuracy(
+        BuildMatMulOpTestCase(input0_def, input1_def),
+        BuildMatMulOpQDQTestCase<uint16_t, uint16_t, uint16_t>(input0_def, input1_def, false),
+        provider_options, 21, ExpectedEPNodeAssignment::All, QDQTolerance());
+  }
+
+  // Test with input[1] as rank 1
+  {
+    std::vector<int64_t> shape_0 = {1, 12, 512, 96};
+    TestInputDef<float> input0_def(
+        {1, 12, 512, 96}, false,
+        GetFloatDataInRange(-5.087f, 4.992f,
+                            static_cast<size_t>(std::accumulate(shape_0.begin(), shape_0.end(), static_cast<int64_t>(1),
+                                                                std::multiplies<int64_t>()))));
+    std::vector<int64_t> shape_1 = {96};
+    TestInputDef<float> input1_def(
+        shape_1, false,
+        GetFloatDataInRange(-6.772f, 7.258f,
+                            static_cast<size_t>(std::accumulate(shape_1.begin(), shape_1.end(), static_cast<int64_t>(1),
+                                                                std::multiplies<int64_t>()))));
+
+    TestQDQModelAccuracy(
+        BuildMatMulOpTestCase(input0_def, input1_def),
+        BuildMatMulOpQDQTestCase<uint16_t, uint16_t, uint16_t>(input0_def, input1_def, false),
+        provider_options, 21, ExpectedEPNodeAssignment::All, QDQTolerance());
+  }
+}
+
+static ProviderOptions GetQDQMatMulProviderOptions(const std::filesystem::path& graph_dir) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+  provider_options["dump_json_qnn_graph"] = "1";
+  provider_options["json_qnn_graph_dir"] = graph_dir.string();
+#ifdef __linux__
+  provider_options["htp_arch"] = "73";
+#endif
+  return provider_options;
+}
+
+static void RunDynamicInput1QuantErrorTest(const char* test_name,
+                                           float input1_min,
+                                           float input1_max,
+                                           Qnn_DataType_t expected_convert_type,
+                                           size_t expected_convert_count = 1) {
+  namespace fs = std::filesystem;
+  const fs::path graph_dir = fs::temp_directory_path() /
+                             (std::string("MatMulOp_QDQ_U16DynamicInput1_") + test_name);
+  fs::remove_all(graph_dir);
+  ASSERT_TRUE(fs::create_directories(graph_dir));
+  auto cleanup = gsl::finally([&graph_dir]() { fs::remove_all(graph_dir); });
+
+  ProviderOptions provider_options = GetQDQMatMulProviderOptions(graph_dir);
+
+  TestInputDef<float> input0_def({2, 3}, false, GetFloatDataInRange(-0.1f, 0.1f, 6));
+  TestInputDef<float> input1_def({3, 2}, false, GetFloatDataInRange(input1_min, input1_max, 6));
+
+  const auto f32_model = BuildMatMulOpTestCase(input0_def, input1_def);
+  const auto qdq_model = BuildMatMulOpQDQTestCase<uint16_t, uint16_t, uint16_t>(input0_def, input1_def, false);
+  TestQDQModelAccuracy(f32_model, qdq_model, provider_options, 21,
+                       ExpectedEPNodeAssignment::All, QDQTolerance());
+
+  if (::testing::Test::IsSkipped()) {
+    return;
+  }
+  AssertOpInQnnGraph(graph_dir, "Convert", expected_convert_count);
+  if (expected_convert_count != 0) {
+    AssertConvertOutputDataType(graph_dir, expected_convert_type);
+  }
+}
+
+// A 16-bit activation with an 8-bit output stays in one node unit: the op runs at 16 bits and a Convert narrows it.
+template <typename ActivationQType, typename WeightQType, typename OutputQType>
+static void RunNarrowingOutputTest(const char* test_name, bool weight_is_initializer,
+                                   Qnn_DataType_t expected_convert_type) {
+  namespace fs = std::filesystem;
+  const fs::path graph_dir = fs::temp_directory_path() / (std::string("MatMulOp_QDQ_NarrowingOutput_") + test_name);
+  fs::remove_all(graph_dir);
+  ASSERT_TRUE(fs::create_directories(graph_dir));
+  auto cleanup = gsl::finally([&graph_dir]() { fs::remove_all(graph_dir); });
+
+  ProviderOptions provider_options = GetQDQMatMulProviderOptions(graph_dir);
+
+  TestInputDef<float> input0_def({2, 16}, false, GetFloatDataInRange(-1.0f, 1.0f, 32));
+  TestInputDef<float> input1_def({16, 8}, weight_is_initializer, GetFloatDataInRange(-0.5f, 0.5f, 128));
+
+  const auto f32_model = BuildMatMulOpTestCase(input0_def, input1_def);
+  const auto qdq_model =
+      BuildMatMulOpQDQTestCase<ActivationQType, WeightQType, OutputQType>(input0_def, input1_def, true);
+  TestQDQModelAccuracy(f32_model, qdq_model, provider_options, 21, ExpectedEPNodeAssignment::All, QDQTolerance());
+
+  if (::testing::Test::IsSkipped()) {
+    return;
+  }
+  AssertOpInQnnGraph(graph_dir, "Convert", 1);
+  AssertConvertOutputDataType(graph_dir, expected_convert_type);
+}
+
+TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_U16ActivationU8Output_StaticWeight) {
+  RunNarrowingOutputTest<uint16_t, uint8_t, uint8_t>("u16_u8_static", /*weight_is_initializer=*/true,
+                                                     QNN_DATATYPE_UFIXED_POINT_8);
+}
+
+TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_U16ActivationU8Output_DynamicInput1) {
+  RunNarrowingOutputTest<uint16_t, uint8_t, uint8_t>("u16_u8_dynamic", /*weight_is_initializer=*/false,
+                                                     QNN_DATATYPE_UFIXED_POINT_8);
+}
+
+TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_U16ActivationS8Output_StaticWeight) {
+  RunNarrowingOutputTest<uint16_t, uint8_t, int8_t>("u16_s8_static", /*weight_is_initializer=*/true,
+                                                    QNN_DATATYPE_SFIXED_POINT_8);
+}
+
+TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_S16ActivationS8Output_StaticWeight) {
+  RunNarrowingOutputTest<int16_t, int8_t, int8_t>("s16_s8_static", /*weight_is_initializer=*/true,
+                                                  QNN_DATATYPE_SFIXED_POINT_8);
+}
+
+TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_U16DynamicInput1_LowQuantErrorUsesAsymmetricU8) {
+  RunDynamicInput1QuantErrorTest("low_error", 0.0f, 0.2f, QNN_DATATYPE_UFIXED_POINT_8);
+}
+
+TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_U16DynamicInput1_HighQuantErrorUsesSymmetricU16) {
+  RunDynamicInput1QuantErrorTest("high_error", 0.0f, 100.0f, QNN_DATATYPE_UFIXED_POINT_16);
+}
+
+TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_U16SymmetricDynamicInput1_PassesThrough) {
+  RunDynamicInput1QuantErrorTest("symmetric_input", -0.1f, 0.1f, QNN_DATATYPE_UFIXED_POINT_16,
+                                 /*expected_convert_count=*/0);
+}
+
+TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_NonU16Input1DoesNotUseU16ConversionGate) {
+  namespace fs = std::filesystem;
+  const fs::path graph_dir = fs::temp_directory_path() / "MatMulOp_QDQ_NonU16Input1";
+  fs::remove_all(graph_dir);
+  ASSERT_TRUE(fs::create_directories(graph_dir));
+  auto cleanup = gsl::finally([&graph_dir]() { fs::remove_all(graph_dir); });
+
+  ProviderOptions provider_options = GetQDQMatMulProviderOptions(graph_dir);
+
+  TestInputDef<float> input0_def({2, 3}, false, GetFloatDataInRange(-0.1f, 0.1f, 6));
+  TestInputDef<float> input1_def({3, 2}, false, GetFloatDataInRange(0.0f, 100.0f, 6));
+  TestQDQModelAccuracy(
+      BuildMatMulOpTestCase(input0_def, input1_def),
+      BuildMatMulOpQDQTestCase<uint16_t, uint8_t, uint16_t>(input0_def, input1_def, false),
+      provider_options, 21, ExpectedEPNodeAssignment::All, QDQTolerance());
+
+  if (::testing::Test::IsSkipped()) {
+    return;
+  }
+  AssertOpInQnnGraph(graph_dir, "Convert", 0);
+}
+
+// Float MatMul whose only QDQ node is a per-channel DQ on a constant weight, as in weight-only quantized LLMs.
+template <typename WeightQType>
+static void RunPerChannelWeightOnlyTest(const char* test_name) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V75);
+  namespace fs = std::filesystem;
+  const fs::path graph_dir = fs::temp_directory_path() / (std::string("MatMulOp_PerChannelWeightOnly_") + test_name);
+  fs::remove_all(graph_dir);
+  ASSERT_TRUE(fs::create_directories(graph_dir));
+  auto cleanup = gsl::finally([&graph_dir]() { fs::remove_all(graph_dir); });
+
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+  provider_options["enable_htp_fp16_precision"] = "1";
+  provider_options["dump_json_qnn_graph"] = "1";
+  provider_options["json_qnn_graph_dir"] = graph_dir.string();
+#if defined(__linux__) && !defined(__aarch64__)
+  provider_options["soc_model"] = std::to_string(QNN_SOC_MODEL_SM8850);
+#endif
+
+  TestInputDef<float> input_def({2, 16}, false, GetFloatDataInRange(-1.0f, 1.0f, 32));
+  TestInputDef<float> weight_def({16, 8}, true, GetFloatDataInRange(-0.5f, 0.5f, 128));
+  const std::vector<int64_t>& weight_shape = weight_def.GetShape();
+  constexpr int64_t kAxis = 1;
+
+  auto build_model = [&](ModelTestBuilder& builder) {
+    MakeTestInput<float>(builder, "input", input_def);
+
+    std::vector<float> scales;
+    std::vector<WeightQType> zero_points;
+    GetTestInputQuantParamsPerChannel<WeightQType>(weight_def, scales, zero_points, kAxis, true);
+
+    size_t num_storage_elems = SizeOfShape(weight_shape);
+    if constexpr (std::is_same_v<WeightQType, Int4x2>) {
+      num_storage_elems = Int4x2::CalcNumInt4Pairs(num_storage_elems);
+    }
+    std::vector<WeightQType> quantized(num_storage_elems);
+    QuantizeValues<float, WeightQType>(weight_def.GetRawData(), quantized, weight_shape, scales, zero_points, kAxis);
+    builder.MakeInitializer<WeightQType>("weight_quant", weight_shape, quantized);
+    builder.AddDequantizeLinearNode<WeightQType>("weight_dq", "weight_quant", scales, zero_points, "weight_dq_out",
+                                                 {builder.MakeScalarAttribute("axis", kAxis)});
+
+    builder.MakeOutput("Y");
+    builder.AddNode("MatMul", "MatMul", {"input", "weight_dq_out"}, {"Y"}, kOnnxDomain);
+  };
+
+  RunQnnModelTest(build_model, provider_options, 21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(0.01f)});
+
+  if (::testing::Test::IsSkipped()) {
+    return;
+  }
+  AssertOpInQnnGraph(graph_dir, "FullyConnected", 1);
+  AssertOpInQnnGraph(graph_dir, "Dequantize", 0);
+}
+
+TEST_F(QnnHTPBackendTests, MatMulOp_F32S8_PerChannelWeightOnly) {
+  RunPerChannelWeightOnlyTest<int8_t>("s8");
+}
+
+TEST_F(QnnHTPBackendTests, MatMulOp_F32S4_PerChannelWeightOnly) {
+  RunPerChannelWeightOnlyTest<Int4x2>("s4");
+}
+
+// Tests MatMul with two uint16 (quantized) inputs with weight as static.
+// This exercises a workaround in QNN EP that inserts a QNN Convert op before input[1] (converts from uint16 to sint16).
+// This workaround prevents a validation error for this specific MatMul configuration.
+// Got specific shapes and input ranges (quant params) from customer model.
+TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_Regression_uint16_static_weight) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+#ifdef __linux__
+  // W16A16 requires minimum HTP arch v73.
+  provider_options["htp_arch"] = "73";
+#endif
+
+  // Test with rank 4 inputs
+  {
+    std::vector<int64_t> shape_0 = {1, 12, 512, 96};
+    TestInputDef<float> input0_def(
+        {1, 12, 512, 96}, false,
+        GetFloatDataInRange(-5.087f, 4.992f,
+                            static_cast<size_t>(std::accumulate(shape_0.begin(), shape_0.end(), static_cast<int64_t>(1),
+                                                                std::multiplies<int64_t>()))));
+    std::vector<int64_t> shape_1 = {1, 12, 96, 512};
+    TestInputDef<float> input1_def(
+        shape_1, true,
+        GetFloatDataInRange(-6.772f, 7.258f,
+                            static_cast<size_t>(std::accumulate(shape_1.begin(), shape_1.end(), static_cast<int64_t>(1),
+                                                                std::multiplies<int64_t>()))));
+
+    TestQDQModelAccuracy(
+        BuildMatMulOpTestCase(input0_def, input1_def),
+        BuildMatMulOpQDQTestCase<uint16_t, uint16_t, uint16_t>(input0_def, input1_def, false),
+        provider_options, 21, ExpectedEPNodeAssignment::All, QDQTolerance());
+  }
+
+  // Test with input[1] as rank 1
+  {
+    std::vector<int64_t> shape_0 = {1, 12, 512, 96};
+    TestInputDef<float> input0_def(
+        {1, 12, 512, 96}, false,
+        GetFloatDataInRange(-5.087f, 4.992f,
+                            static_cast<size_t>(std::accumulate(shape_0.begin(), shape_0.end(), static_cast<int64_t>(1),
+                                                                std::multiplies<int64_t>()))));
+    std::vector<int64_t> shape_1 = {96};
+    TestInputDef<float> input1_def(
+        shape_1, true,
+        GetFloatDataInRange(-6.772f, 7.258f,
+                            static_cast<size_t>(std::accumulate(shape_1.begin(), shape_1.end(), static_cast<int64_t>(1),
+                                                                std::multiplies<int64_t>()))));
+
+    TestQDQModelAccuracy(
+        BuildMatMulOpTestCase(input0_def, input1_def),
+        BuildMatMulOpQDQTestCase<uint16_t, uint16_t, uint16_t>(input0_def, input1_def, false),
+        provider_options, 21, ExpectedEPNodeAssignment::All, QDQTolerance());
+  }
+}
+#endif  // defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
+
+#if defined(__linux__)
+
+// Tests MatMul with ONNX block-quantized (BQ) weight using the BQ -> QNN LPBQ conversion path.
+// Currently BQ -> LPBQ conversion is only supported on Linux. It will be later enabled for windows as well.
+TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_BlockQuant) {
+  RunQDQBlockQuantMatMulOpTest<uint16_t, Int4x2, uint16_t>({4, 16}, {16, 8}, 8, 0, QDQTolerance(0.05f));
+  RunQDQBlockQuantMatMulOpTest<int16_t, Int4x2, int16_t>({4, 128}, {128, 64}, 32, 0, QDQTolerance(0.05f));
+  RunQDQBlockQuantMatMulOpTest<int16_t, Int4x2, int16_t>({4, 128}, {128, 64}, 64, 0, QDQTolerance(0.05f));
+  RunQDQBlockQuantMatMulOpTest<uint16_t, Int4x2, uint16_t>({2, 4, 16}, {16, 8}, 8, 0, QDQTolerance(0.05f));
+  RunQDQBlockQuantMatMulOpTest<uint16_t, Int4x2, uint16_t>({2, 3, 4, 16}, {16, 8}, 8, 0, QDQTolerance(0.05f));
+}
+
+#endif  // defined(__linux__)
+
+#if defined(_M_ARM64)
+//
+// GPU tests:
+//
+
+// RunMatMulOpTest(shape_0, shape_1, is_initializer_0, is_initializer_1, expected_ep_assignment, backend);
+
+TEST_F(QnnGPUBackendTests, MatMulOp_simple) {
+  RunMatMulOpTest({2, 3}, {3, 2}, false, false, ExpectedEPNodeAssignment::All, "gpu");
+  RunMatMulOpTest({2, 3}, {3, 2}, false, true, ExpectedEPNodeAssignment::All, "gpu");
+  RunMatMulOpTest({2, 3}, {3, 2}, true, false, ExpectedEPNodeAssignment::All, "gpu");
+  RunMatMulOpTest({2, 3}, {3, 2}, true, true, ExpectedEPNodeAssignment::All, "gpu");  // constant folding
+}
+
+TEST_F(QnnGPUBackendTests, MatMulOp_batches) {
+  RunMatMulOpTest({3, 3, 3}, {3, 2}, false, true, ExpectedEPNodeAssignment::All, "gpu");
+  RunMatMulOpTest({2, 3, 3, 3}, {3, 2}, false, true, ExpectedEPNodeAssignment::All, "gpu");
+}
+
+TEST_F(QnnGPUBackendTests, MatMulOp_batchesWtsSameDim) {
+  RunMatMulOpTest({3, 3, 3}, {3, 3, 2}, false, true, ExpectedEPNodeAssignment::All, "gpu");
+}
+
+TEST_F(QnnGPUBackendTests, MatMulOp_batchesWtsSameDim2) {
+  RunMatMulOpTest({2, 3, 3, 3}, {2, 3, 3, 2}, false, true, ExpectedEPNodeAssignment::All, "gpu");
+}
+
+TEST_F(QnnGPUBackendTests, MatMulOp_wtsDimBcast) {
+  RunMatMulOpTest({3, 3, 3}, {1, 3, 2}, false, true, ExpectedEPNodeAssignment::All, "gpu");
+}
+
+TEST_F(QnnGPUBackendTests, DISABLED_MatMulOp_batchesDimBcast) {
+  RunMatMulOpTest({1, 3, 3}, {3, 3, 2}, false, true, ExpectedEPNodeAssignment::All, "gpu");
+}
+
+TEST_F(QnnGPUBackendTests, DISABLED_MatMulOp_batchesDimBcast2) {
+  RunMatMulOpTest({2, 1, 3, 3}, {3, 3, 2}, false, true, ExpectedEPNodeAssignment::All, "gpu");
+}
+
+TEST_F(QnnGPUBackendTests, MatMulOp_inp0DimBcast) {
+  RunMatMulOpTest({3, 3}, {3, 3, 2}, false, false, ExpectedEPNodeAssignment::All, "gpu");
+}
+
+TEST_F(QnnGPUBackendTests, MatMulOp_inp1DimBcast) {
+  RunMatMulOpTest({2, 3, 3}, {3, 2}, false, false, ExpectedEPNodeAssignment::All, "gpu");
+}
+
+TEST_F(QnnGPUBackendTests, MatMulOp_rank1) {
+  RunMatMulOpTest({3}, {3}, false, false, ExpectedEPNodeAssignment::All, "gpu");
+  RunMatMulOpTest({3}, {3}, false, true, ExpectedEPNodeAssignment::All, "gpu");
+  RunMatMulOpTest({3}, {3}, true, false, ExpectedEPNodeAssignment::All, "gpu");
+  RunMatMulOpTest({3}, {3, 2}, false, false, ExpectedEPNodeAssignment::All, "gpu");
+  RunMatMulOpTest({3}, {3, 2}, false, true, ExpectedEPNodeAssignment::All, "gpu");
+  RunMatMulOpTest({3}, {3, 3, 2}, true, false, ExpectedEPNodeAssignment::All, "gpu");
+  RunMatMulOpTest({2, 3}, {3}, false, false, ExpectedEPNodeAssignment::All, "gpu");
+  RunMatMulOpTest({2, 3}, {3}, true, false, ExpectedEPNodeAssignment::All, "gpu");
+  RunMatMulOpTest({2, 3, 3, 3}, {3}, false, false, ExpectedEPNodeAssignment::All, "gpu");
+}
+
+#endif  // defined(_M_ARM64) GPU tests
+
+}  // namespace test
+}  // namespace onnxruntime
+
+#endif  // !defined(ORT_MINIMAL_BUILD)

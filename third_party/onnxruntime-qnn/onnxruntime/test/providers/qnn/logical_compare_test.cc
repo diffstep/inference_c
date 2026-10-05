@@ -1,0 +1,195 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#if !defined(ORT_MINIMAL_BUILD)
+
+#include <string>
+#include <unordered_map>
+
+#include "test/providers/qnn/qnn_test_utils.h"
+#include "test/unittest_util/qdq_test_utils.h"
+
+#include "gtest/gtest.h"
+
+namespace onnxruntime {
+namespace test {
+
+// Creates a graph with a single logical operator (e.g., Equal). Used for testing CPU backend.
+static GetTestModelFn BuildLogicalOpTestCase(const std::string& op_type, const std::vector<int64_t>& shape) {
+  return [op_type, shape](ModelTestBuilder& builder) {
+    builder.graph_->set_name("logical_comp_graph");
+
+    builder.MakeInput<float>("input0", shape, 0.0f, 20.0f);
+    builder.MakeInput<float>("input1", shape, 0.0f, 20.0f);
+
+    // Explicitly set output type/shape for logical comparison ops implemented as functions.
+    if (op_type == "GreaterOrEqual" || op_type == "LessOrEqual") {
+      builder.MakeOutput<bool>("output", shape);
+    } else {
+      builder.MakeOutput("output");
+    }
+
+    builder.AddNode("logical_op", op_type, {"input0", "input1"}, {"output"});
+  };
+}
+
+// Creates a graph with a single Q/DQ logical operator. Used for testing HTP backend.
+template <typename InputQType = uint8_t>
+static GetTestModelFn BuildQDQLogicalOpTestCase(const std::string& op_type, const std::vector<int64_t>& shape) {
+  return [op_type, shape](ModelTestBuilder& builder) {
+    builder.graph_->set_name("qdq_logical_comp_graph");
+
+    const InputQType zero_point = std::numeric_limits<InputQType>::max() / 2;
+    constexpr float qdq_scale = 0.0038f;
+
+    builder.MakeInput<float>("input0", shape, -1.0f, 1.0f);
+    builder.MakeInput<float>("input1", shape, -1.0f, 1.0f);
+
+    // Explicitly set output type/shape for logical comparison ops implemented as functions.
+    if (op_type == "GreaterOrEqual" || op_type == "LessOrEqual") {
+      builder.MakeOutput<bool>("output", shape);
+    } else {
+      builder.MakeOutput("output");
+    }
+
+    // input -> Q -> DQ -> Op
+    std::string qdq0_output = AddQDQNodePair<InputQType>(builder, "qdq_0", "input0", qdq_scale, zero_point);
+    std::string qdq1_output = AddQDQNodePair<InputQType>(builder, "qdq_1", "input1", qdq_scale, zero_point);
+
+    // Op -> output
+    builder.AddNode("logical_op", op_type, {qdq0_output, qdq1_output}, {"output"});
+  };
+}
+
+// Runs a model with a logical operator on the QNN CPU backend. Checks the graph node assignment, and that inference
+// outputs for QNN EP and CPU EP match.
+static void RunCPULogicalOpTest(const std::string& op_type, const std::vector<int64_t>& shape,
+                                ExpectedEPNodeAssignment expected_ep_assignment,
+                                int opset = 17) {
+  ProviderOptions provider_options;
+
+  provider_options["backend_type"] = "cpu";
+  provider_options["offload_graph_io_quantization"] = "0";
+
+  RunQnnModelTest(BuildLogicalOpTestCase(op_type, shape),
+                  provider_options,
+                  opset,
+                  EPVerificationParams{expected_ep_assignment});
+}
+
+// Runs a model with a logical operator on the QNN HTP backend. Checks the graph node assignment, and that inference
+// outputs for QNN EP and CPU EP match.
+template <typename QuantType>
+static void RunQDQLogicalOpTest(const std::string& op_type, const std::vector<int64_t>& shape,
+                                ExpectedEPNodeAssignment expected_ep_assignment,
+                                int opset = 17) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+
+  RunQnnModelTest(BuildQDQLogicalOpTestCase<QuantType>(op_type, shape),
+                  provider_options,
+                  opset,
+                  EPVerificationParams{expected_ep_assignment});
+}
+
+//
+// CPU tests:
+//
+
+TEST_F(QnnCPUBackendTests, LogicalOpEqual4D) {
+  RunCPULogicalOpTest("Equal", {1, 3, 16, 16}, ExpectedEPNodeAssignment::All);
+}
+
+TEST_F(QnnCPUBackendTests, LogicalOpGreater4D) {
+  RunCPULogicalOpTest("Greater", {1, 3, 16, 16}, ExpectedEPNodeAssignment::All);
+}
+
+TEST_F(QnnCPUBackendTests, LogicalOpGreaterOrEqual4D) {
+  RunCPULogicalOpTest("GreaterOrEqual", {1, 3, 16, 16}, ExpectedEPNodeAssignment::All);
+}
+
+TEST_F(QnnCPUBackendTests, LogicalOpLess4D) {
+  RunCPULogicalOpTest("Less", {1, 3, 16, 16}, ExpectedEPNodeAssignment::All);
+}
+
+TEST_F(QnnCPUBackendTests, LogicalOpLessOrEqual4D) {
+  RunCPULogicalOpTest("LessOrEqual", {1, 3, 16, 16}, ExpectedEPNodeAssignment::All);
+}
+
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
+//
+// HTP tests:
+//
+
+TEST_F(QnnHTPBackendTests, LogicalOpEqual4D) {
+  RunQDQLogicalOpTest<uint8_t>("Equal", {1, 3, 16, 16}, ExpectedEPNodeAssignment::All);
+}
+
+TEST_F(QnnHTPBackendTests, LogicalOpGreater4D) {
+  RunQDQLogicalOpTest<uint8_t>("Greater", {1, 3, 16, 16}, ExpectedEPNodeAssignment::All);
+}
+
+TEST_F(QnnHTPBackendTests, LogicalOpGreaterOrEqual4D) {
+  RunQDQLogicalOpTest<uint8_t>("GreaterOrEqual", {1, 3, 16, 16}, ExpectedEPNodeAssignment::All);
+}
+
+TEST_F(QnnHTPBackendTests, LogicalOpLess4D) {
+  RunQDQLogicalOpTest<uint8_t>("Less", {1, 3, 16, 16}, ExpectedEPNodeAssignment::All);
+}
+
+TEST_F(QnnHTPBackendTests, LogicalOpLessOrEqual4D) {
+  RunQDQLogicalOpTest<uint8_t>("LessOrEqual", {1, 3, 16, 16}, ExpectedEPNodeAssignment::All);
+}
+
+// Test for bug 44777546.
+// Tests a QDQ graph with an Equal node followed by a Cast.
+TEST_F(QnnHTPBackendTests, EqualToCast4D) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+
+  // Model building function that creates a QDQ graph with an Equal node followed by
+  // a Cast to float32.
+  auto build_qdq_equal_to_cast = [](ModelTestBuilder& builder) {
+    builder.graph_->set_name("qdq_equal_to_cast_graph");
+
+    constexpr uint8_t zero_point = 0;
+    constexpr float qdq_scale = 0.0038f;
+    const std::vector<int64_t> input_shape = {1, 3, 8, 8};
+
+    builder.MakeInput<float>("input0", input_shape, -1.0f, 1.0f);
+    builder.MakeInput<float>("input1", input_shape, -1.0f, 1.0f);
+    builder.MakeOutput("output");
+
+    // input -> Q -> DQ -> Equal
+    std::string qdq0_output = AddQDQNodePair<uint8_t>(builder, "qdq_0", "input0", qdq_scale, zero_point);
+    std::string qdq1_output = AddQDQNodePair<uint8_t>(builder, "qdq_1", "input1", qdq_scale, zero_point);
+
+    builder.AddNode("equal", "Equal", {qdq0_output, qdq1_output}, {"equal_out"});
+
+    // equal_out -> Cast -> output
+    std::vector<ONNX_NAMESPACE::AttributeProto> attrs;
+    attrs.push_back(builder.MakeScalarAttribute(
+        "to",
+        static_cast<int64_t>(ONNX_NAMESPACE::TensorProto_DataType::TensorProto_DataType_FLOAT)));
+    builder.AddNode("cast", "Cast", {"equal_out"}, {"output"}, "", attrs);
+  };
+
+  // This test was added in commit 5a4c3b7937c34cad9671e6440a03aa024a98bf19, at which point
+  // RunQnnModelTest expected an arg for `num_nodes_in_ep`. This "1" has appeared to have survived
+  // changes to RunQnnModelTest and has now erroneously ended up as the fp32_abs_err arg, which means
+  // this test is probably not testing for the correct thing anymore.
+  // TODO: Fix this test, perhaps by using `EPVerificationParams::graph_verifier`?
+  RunQnnModelTest(build_qdq_equal_to_cast,
+                  provider_options,
+                  17,  // opset
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(1)});
+}
+
+#endif  // defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
+
+}  // namespace test
+}  // namespace onnxruntime
+
+#endif  // !defined(ORT_MINIMAL_BUILD)

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: GitHub Discussions
+    url: https://github.com/onnxruntime/onnxruntime-qnn/issues
+    about: questions and discussions related to ONNX Runtime QNN
+  - name: Security Vulnerabilities
+    url: https://github.com/microsoft/onnxruntime/security/policy
+    about: review our security policy for more details

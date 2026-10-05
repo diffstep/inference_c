@@ -1,0 +1,221 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#include <limits>
+
+#include "core/providers/qnn/builder/op_builder_factory.h"
+#include "core/providers/qnn/builder/opbuilder/base_op_builder.h"
+#include "core/providers/qnn/builder/qnn_model_wrapper.h"
+#include "core/providers/qnn/builder/qnn_utils.h"
+
+namespace onnxruntime {
+namespace qnn {
+class ClipOpBuilder : public BaseOpBuilder {
+ public:
+  ClipOpBuilder() : BaseOpBuilder("ClipOpBuilder") {}
+  ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(ClipOpBuilder);
+
+ protected:
+  Ort::Status ProcessInputs(QnnModelWrapper& qnn_model_wrapper,
+                            const OrtNodeUnit& node_unit,
+                            const Ort::Logger& logger,
+                            std::vector<std::string>& input_names,
+                            bool do_op_validation) const override ORT_MUST_USE_RESULT;
+
+  Ort::Status ProcessAttributesAndOutputs(QnnModelWrapper& qnn_model_wrapper,
+                                          const OrtNodeUnit& node_unit,
+                                          std::vector<std::string>&& input_names,
+                                          const Ort::Logger& logger,
+                                          bool do_op_validation) const override ORT_MUST_USE_RESULT;
+
+ private:
+  Ort::Status ExplicitOpCheck(QnnModelWrapper& qnn_model_wrapper, const OrtNodeUnit& node_unit) const;
+};
+
+static Ort::Status ProcessClipMinMax(QnnModelWrapper& qnn_model_wrapper,
+                                     const OrtNodeUnitIODef& input,
+                                     bool is_min,
+                                     float& float_value) {
+  TensorInfo input_info = {};
+  std::vector<uint8_t> val_bytes;
+  RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(input, input_info));
+
+  RETURN_IF_NOT(input_info.is_initializer, "QNN EP: Clip min/max must be a constant initializer.");
+  RETURN_IF_ERROR(qnn_model_wrapper.UnpackInitializerData(input_info.initializer_tensor, val_bytes));
+
+  // If the input is quantized, we need to dequantize it
+  if (input.quant_param.has_value()) {
+    RETURN_IF_NOT(input_info.quant_param.IsPerTensor(), "Clip's min/max must use per-tensor quantization");
+    const Qnn_QuantizeParams_t& quant_param = input_info.quant_param.Get();
+
+    switch (input_info.qnn_data_type) {
+      case QNN_DATATYPE_SFIXED_POINT_8: {
+        int8_t quantized_value = *reinterpret_cast<int8_t*>(val_bytes.data());
+        float_value = static_cast<float>(utils::Dequantize(quant_param.scaleOffsetEncoding.offset,
+                                                           quant_param.scaleOffsetEncoding.scale,
+                                                           static_cast<double>(quantized_value)));
+        break;
+      }
+      case QNN_DATATYPE_SFIXED_POINT_16: {
+        int16_t quantized_value = *reinterpret_cast<int16_t*>(val_bytes.data());
+        float_value = static_cast<float>(utils::Dequantize(quant_param.scaleOffsetEncoding.offset,
+                                                           quant_param.scaleOffsetEncoding.scale,
+                                                           static_cast<double>(quantized_value)));
+        break;
+      }
+      case QNN_DATATYPE_SFIXED_POINT_32: {
+        int32_t quantized_value = *reinterpret_cast<int32_t*>(val_bytes.data());
+        float_value = static_cast<float>(utils::Dequantize(quant_param.scaleOffsetEncoding.offset,
+                                                           quant_param.scaleOffsetEncoding.scale,
+                                                           static_cast<double>(quantized_value)));
+        break;
+      }
+      case QNN_DATATYPE_UFIXED_POINT_8: {
+        uint8_t quantized_value = *val_bytes.data();
+        float_value = static_cast<float>(utils::Dequantize(quant_param.scaleOffsetEncoding.offset,
+                                                           quant_param.scaleOffsetEncoding.scale,
+                                                           static_cast<double>(quantized_value)));
+        break;
+      }
+      case QNN_DATATYPE_UFIXED_POINT_16: {
+        uint16_t quantized_value = *reinterpret_cast<uint16_t*>(val_bytes.data());
+        float_value = static_cast<float>(utils::Dequantize(quant_param.scaleOffsetEncoding.offset,
+                                                           quant_param.scaleOffsetEncoding.scale,
+                                                           static_cast<double>(quantized_value)));
+        break;
+      }
+      case QNN_DATATYPE_UFIXED_POINT_32: {
+        uint32_t quantized_value = *reinterpret_cast<uint32_t*>(val_bytes.data());
+        float_value = static_cast<float>(utils::Dequantize(quant_param.scaleOffsetEncoding.offset,
+                                                           quant_param.scaleOffsetEncoding.scale,
+                                                           static_cast<double>(quantized_value)));
+        break;
+      }
+      default:
+        return MAKE_EP_FAIL("Quantized min/max input data type not supported.");
+    }
+  } else {
+    // Non-quantized input, just cast to float
+    switch (input_info.qnn_data_type) {
+      case QNN_DATATYPE_INT_8: {
+        float_value = static_cast<float>(*reinterpret_cast<int8_t*>(val_bytes.data()));
+        break;
+      }
+      case QNN_DATATYPE_INT_16: {
+        float_value = static_cast<float>(*reinterpret_cast<int16_t*>(val_bytes.data()));
+        break;
+      }
+      case QNN_DATATYPE_INT_32: {
+        float_value = static_cast<float>(*reinterpret_cast<int32_t*>(val_bytes.data()));
+        break;
+      }
+      case QNN_DATATYPE_INT_64: {
+        float_value = static_cast<float>(*reinterpret_cast<int64_t*>(val_bytes.data()));
+        break;
+      }
+      case QNN_DATATYPE_UINT_8: {
+        float_value = static_cast<float>(*val_bytes.data());
+        break;
+      }
+      case QNN_DATATYPE_UINT_16: {
+        float_value = static_cast<float>(*reinterpret_cast<uint16_t*>(val_bytes.data()));
+        break;
+      }
+      case QNN_DATATYPE_UINT_32: {
+        float_value = static_cast<float>(*reinterpret_cast<uint32_t*>(val_bytes.data()));
+        break;
+      }
+      case QNN_DATATYPE_UINT_64: {
+        float_value = static_cast<float>(*reinterpret_cast<uint64_t*>(val_bytes.data()));
+        break;
+      }
+      case QNN_DATATYPE_FLOAT_16: {
+        Ort::Float16_t fp16_value = *reinterpret_cast<const Ort::Float16_t*>(val_bytes.data());
+        float_value = fp16_value.ToFloat();
+        break;
+      }
+      case QNN_DATATYPE_FLOAT_32: {
+        float_value = *reinterpret_cast<const float*>(val_bytes.data());
+        break;
+      }
+      default:
+        return MAKE_EP_FAIL("Non-quantized min/max input data type not supported.");
+    }
+  }
+
+  // Avoid infinite bounds, which may not place nicely with all backends
+  if (is_min) {
+    float_value = std::max(float_value, std::numeric_limits<float>::lowest());
+  } else {
+    float_value = std::min(float_value, std::numeric_limits<float>::max());
+  }
+
+  return Ort::Status();
+}
+
+Ort::Status ClipOpBuilder::ExplicitOpCheck(QnnModelWrapper& qnn_model_wrapper, const OrtNodeUnit& node_unit) const {
+  if (node_unit.Inputs().size() > 1) {
+    const auto& min_input_name = node_unit.Inputs()[1].name;
+    RETURN_IF(!min_input_name.empty() && !qnn_model_wrapper.IsConstantInput(min_input_name),
+              "QNN doesn't support dynamic min/max.");
+  }
+  if (node_unit.Inputs().size() > 2) {
+    const auto& max_input_name = node_unit.Inputs()[2].name;
+    RETURN_IF(!max_input_name.empty() && !qnn_model_wrapper.IsConstantInput(max_input_name),
+              "QNN doesn't support dynamic min/max.");
+  }
+  return Ort::Status();
+}
+
+Ort::Status ClipOpBuilder::ProcessInputs(QnnModelWrapper& qnn_model_wrapper,
+                                         const OrtNodeUnit& node_unit,
+                                         const Ort::Logger& logger,
+                                         std::vector<std::string>& input_names,
+                                         bool do_op_validation) const {
+  if (do_op_validation) {
+    RETURN_IF_ERROR(ExplicitOpCheck(qnn_model_wrapper, node_unit));
+  }
+
+  return ProcessInput(qnn_model_wrapper, node_unit.Inputs()[0], logger, input_names);
+}
+
+Ort::Status ClipOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_model_wrapper,
+                                                       const OrtNodeUnit& node_unit,
+                                                       std::vector<std::string>&& input_names,
+                                                       const Ort::Logger& logger,
+                                                       bool do_op_validation) const {
+  const auto& inputs = node_unit.Inputs();
+  const size_t num_inputs = inputs.size();
+
+  std::vector<std::string> param_tensor_names;
+
+  // Set the 'min' parameter.
+  float min_value = std::numeric_limits<float>::lowest();
+  if (num_inputs > 1 && !inputs[1].name.empty()) {
+    RETURN_IF_ERROR(ProcessClipMinMax(qnn_model_wrapper, inputs[1], true, min_value));
+  }
+  RETURN_IF_ERROR(AddQnnScalar<float>(qnn_model_wrapper, node_unit.Index(), node_unit.Name(), min_value,
+                                      QNN_OP_RELU_MIN_MAX_PARAM_MIN_VALUE, param_tensor_names));
+
+  // Set the 'max' parameter.
+  float max_value = std::numeric_limits<float>::max();
+  if (num_inputs > 2 && !inputs[2].name.empty()) {
+    RETURN_IF_ERROR(ProcessClipMinMax(qnn_model_wrapper, inputs[2], false, max_value));
+  }
+  RETURN_IF_ERROR(AddQnnScalar<float>(qnn_model_wrapper, node_unit.Index(), node_unit.Name(), max_value,
+                                      QNN_OP_RELU_MIN_MAX_PARAM_MAX_VALUE, param_tensor_names));
+
+  RETURN_IF_ERROR(ProcessOutputs(qnn_model_wrapper, node_unit,
+                                 std::move(input_names),
+                                 std::move(param_tensor_names),
+                                 logger, do_op_validation, GetQnnOpType(node_unit.OpType())));
+
+  return Ort::Status();
+}
+
+void CreateClipOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations) {
+  op_registrations.AddOpBuilder(op_type, std::make_unique<ClipOpBuilder>());
+}
+
+}  // namespace qnn
+}  // namespace onnxruntime

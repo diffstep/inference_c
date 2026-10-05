@@ -1,0 +1,907 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#include <cmath>
+#include <limits>
+#include <utility>
+
+#include "core/providers/qnn/builder/op_builder_factory.h"
+#include "core/providers/qnn/builder/opbuilder/base_op_builder.h"
+#include "core/providers/qnn/builder/qnn_model_wrapper.h"
+#include "core/providers/qnn/builder/qnn_utils.h"
+#include "core/providers/qnn/common/qnn_graph_utils.h"
+
+namespace onnxruntime {
+namespace qnn {
+
+class BatchNormalizationOpBuilder : public BaseOpBuilder {
+ public:
+  BatchNormalizationOpBuilder() : BaseOpBuilder("BatchNormalizationOpBuilder") {}
+  ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(BatchNormalizationOpBuilder);
+
+  Ort::Status ProcessInputs(QnnModelWrapper& qnn_model_wrapper,
+                            const OrtNodeUnit& node_unit,
+                            const Ort::Logger& logger,
+                            std::vector<std::string>& input_names,
+                            bool do_op_validation) const override ORT_MUST_USE_RESULT;
+
+  Ort::Status ProcessAttributesAndOutputs(QnnModelWrapper& qnn_model_wrapper,
+                                          const OrtNodeUnit& node_unit,
+                                          std::vector<std::string>&& input_names,
+                                          const Ort::Logger& logger,
+                                          bool do_op_validation) const override ORT_MUST_USE_RESULT;
+
+  Ort::Status IsOpSupported(QnnModelWrapper& qnn_model_wrapper,
+                            const OrtNodeUnit& node_unit,
+                            const Ort::Logger& logger) const override final ORT_MUST_USE_RESULT;
+
+  inline Ort::Status GetValueOnQnnDataType(const Qnn_DataType_t qnn_data_type,
+                                           const uint8_t* raw_ptr,
+                                           double& value,
+                                           int& offset) const {
+    switch (qnn_data_type) {
+      case QNN_DATATYPE_INT_8:
+      case QNN_DATATYPE_SFIXED_POINT_8: {
+        value = static_cast<double>(*reinterpret_cast<const int8_t*>(raw_ptr));
+        offset += sizeof(int8_t);
+        break;
+      }
+      case QNN_DATATYPE_INT_16:
+      case QNN_DATATYPE_SFIXED_POINT_16: {
+        value = static_cast<double>(*reinterpret_cast<const int16_t*>(raw_ptr));
+        offset += sizeof(int16_t);
+        break;
+      }
+      case QNN_DATATYPE_INT_32:
+      case QNN_DATATYPE_SFIXED_POINT_32: {
+        value = static_cast<double>(*reinterpret_cast<const int32_t*>(raw_ptr));
+        offset += sizeof(int32_t);
+        break;
+      }
+      case QNN_DATATYPE_INT_64: {
+        value = static_cast<double>(*reinterpret_cast<const int64_t*>(raw_ptr));
+        offset += sizeof(int64_t);
+        break;
+      }
+      case QNN_DATATYPE_UINT_8:
+      case QNN_DATATYPE_UFIXED_POINT_8: {
+        value = static_cast<double>(*reinterpret_cast<const uint8_t*>(raw_ptr));
+        offset += sizeof(uint8_t);
+        break;
+      }
+      case QNN_DATATYPE_UINT_16:
+      case QNN_DATATYPE_UFIXED_POINT_16: {
+        value = static_cast<double>(*reinterpret_cast<const uint16_t*>(raw_ptr));
+        offset += sizeof(uint16_t);
+        break;
+      }
+      case QNN_DATATYPE_UINT_32:
+      case QNN_DATATYPE_UFIXED_POINT_32: {
+        value = static_cast<double>(*reinterpret_cast<const uint32_t*>(raw_ptr));
+        offset += sizeof(uint32_t);
+        break;
+      }
+      case QNN_DATATYPE_UINT_64: {
+        value = static_cast<double>(*reinterpret_cast<const uint64_t*>(raw_ptr));
+        offset += sizeof(uint64_t);
+        break;
+      }
+      case QNN_DATATYPE_FLOAT_32: {
+        value = static_cast<double>(*reinterpret_cast<const float*>(raw_ptr));
+        offset += sizeof(float);
+        break;
+      }
+      case QNN_DATATYPE_FLOAT_16: {
+        value = static_cast<double>(reinterpret_cast<const Ort::Float16_t*>(raw_ptr)->ToFloat());
+        offset += sizeof(Ort::Float16_t);
+        break;
+      }
+      case QNN_DATATYPE_BOOL_8:
+      case QNN_DATATYPE_STRING:
+      default:
+        RETURN_IF(true, ("Qnn Data Type: " + std::to_string(qnn_data_type) + " not supported yet.").c_str());
+    }
+    return Ort::Status();
+  }
+
+  inline Ort::Status AssertUnpackedTensorSize(const Qnn_DataType_t qnn_data_type,
+                                              const uint32_t channel,
+                                              const size_t raw_ptr_length) const {
+    switch (qnn_data_type) {
+      case QNN_DATATYPE_INT_8:
+      case QNN_DATATYPE_SFIXED_POINT_8: {
+        RETURN_IF_NOT(channel == static_cast<uint32_t>(raw_ptr_length / sizeof(int8_t)),
+                      "initializer size not match Qnn data type.");
+        break;
+      }
+      case QNN_DATATYPE_INT_16:
+      case QNN_DATATYPE_SFIXED_POINT_16: {
+        RETURN_IF_NOT(channel == static_cast<uint32_t>(raw_ptr_length / sizeof(int16_t)),
+                      "initializer size not match Qnn data type.");
+        break;
+      }
+      case QNN_DATATYPE_INT_32:
+      case QNN_DATATYPE_SFIXED_POINT_32: {
+        RETURN_IF_NOT(channel == static_cast<uint32_t>(raw_ptr_length / sizeof(int32_t)),
+                      "initializer size not match Qnn data type.");
+        break;
+      }
+      case QNN_DATATYPE_INT_64: {
+        RETURN_IF_NOT(channel == static_cast<uint32_t>(raw_ptr_length / sizeof(int64_t)),
+                      "initializer size not match Qnn data type.");
+        break;
+      }
+      case QNN_DATATYPE_UINT_8:
+      case QNN_DATATYPE_UFIXED_POINT_8: {
+        RETURN_IF_NOT(channel == static_cast<uint32_t>(raw_ptr_length / sizeof(uint8_t)),
+                      "initializer size not match Qnn data type.");
+        break;
+      }
+      case QNN_DATATYPE_UINT_16:
+      case QNN_DATATYPE_UFIXED_POINT_16: {
+        RETURN_IF_NOT(channel == static_cast<uint32_t>(raw_ptr_length / sizeof(uint16_t)),
+                      "initializer size not match Qnn data type.");
+        break;
+      }
+      case QNN_DATATYPE_UINT_32:
+      case QNN_DATATYPE_UFIXED_POINT_32: {
+        RETURN_IF_NOT(channel == static_cast<uint32_t>(raw_ptr_length / sizeof(uint32_t)),
+                      "initializer size not match Qnn data type.");
+        break;
+      }
+      case QNN_DATATYPE_UINT_64: {
+        RETURN_IF_NOT(channel == static_cast<uint32_t>(raw_ptr_length / sizeof(uint64_t)),
+                      "initializer size not match Qnn data type.");
+        break;
+      }
+      case QNN_DATATYPE_FLOAT_32: {
+        RETURN_IF_NOT(channel == static_cast<uint32_t>(raw_ptr_length / sizeof(float)),
+                      "initializer size not match Qnn data type.");
+        break;
+      }
+      case QNN_DATATYPE_FLOAT_16: {
+        RETURN_IF_NOT(channel == static_cast<uint32_t>(raw_ptr_length / sizeof(Ort::Float16_t)),
+                      "initializer size not match Qnn data type.");
+        break;
+      }
+      case QNN_DATATYPE_BOOL_8:
+      case QNN_DATATYPE_STRING:
+      default:
+        return MAKE_EP_FAIL(("Qnn Data Type: " + std::to_string(qnn_data_type) + " is not supported yet.").c_str());
+    }
+    return Ort::Status();
+  }
+
+  inline Ort::Status ConvertToRawOnQnnDataType(const Qnn_DataType_t qnn_data_type,
+                                               const std::vector<double>& double_tensor,
+                                               std::vector<uint8_t>& raw_tensor) const {
+    switch (qnn_data_type) {
+      case QNN_DATATYPE_INT_8: {
+        raw_tensor.resize(double_tensor.size() * sizeof(int8_t));
+        int8_t* raw_ptr = reinterpret_cast<int8_t*>(raw_tensor.data());
+        for (size_t i = 0; i < double_tensor.size(); ++i) {
+          raw_ptr[i] = static_cast<int8_t>(double_tensor[i]);
+        }
+        break;
+      }
+      case QNN_DATATYPE_INT_16: {
+        raw_tensor.resize(double_tensor.size() * sizeof(int16_t));
+        int16_t* raw_ptr = reinterpret_cast<int16_t*>(raw_tensor.data());
+        for (size_t i = 0; i < double_tensor.size(); ++i) {
+          raw_ptr[i] = static_cast<int16_t>(double_tensor[i]);
+        }
+        break;
+      }
+      case QNN_DATATYPE_INT_32: {
+        raw_tensor.resize(double_tensor.size() * sizeof(int32_t));
+        int32_t* raw_ptr = reinterpret_cast<int32_t*>(raw_tensor.data());
+        for (size_t i = 0; i < double_tensor.size(); ++i) {
+          raw_ptr[i] = static_cast<int32_t>(double_tensor[i]);
+        }
+        break;
+      }
+      case QNN_DATATYPE_INT_64: {
+        raw_tensor.resize(double_tensor.size() * sizeof(int64_t));
+        int64_t* raw_ptr = reinterpret_cast<int64_t*>(raw_tensor.data());
+        for (size_t i = 0; i < double_tensor.size(); ++i) {
+          raw_ptr[i] = static_cast<int64_t>(double_tensor[i]);
+        }
+        break;
+      }
+      case QNN_DATATYPE_UINT_8: {
+        raw_tensor.resize(double_tensor.size() * sizeof(uint8_t));
+        uint8_t* raw_ptr = reinterpret_cast<uint8_t*>(raw_tensor.data());
+        for (size_t i = 0; i < double_tensor.size(); ++i) {
+          raw_ptr[i] = static_cast<uint8_t>(double_tensor[i]);
+        }
+        break;
+      }
+      case QNN_DATATYPE_UINT_16: {
+        raw_tensor.resize(double_tensor.size() * sizeof(uint16_t));
+        uint16_t* raw_ptr = reinterpret_cast<uint16_t*>(raw_tensor.data());
+        for (size_t i = 0; i < double_tensor.size(); ++i) {
+          raw_ptr[i] = static_cast<uint16_t>(double_tensor[i]);
+        }
+        break;
+      }
+      case QNN_DATATYPE_UINT_32: {
+        raw_tensor.resize(double_tensor.size() * sizeof(uint32_t));
+        uint32_t* raw_ptr = reinterpret_cast<uint32_t*>(raw_tensor.data());
+        for (size_t i = 0; i < double_tensor.size(); ++i) {
+          raw_ptr[i] = static_cast<uint32_t>(double_tensor[i]);
+        }
+        break;
+      }
+      case QNN_DATATYPE_UINT_64: {
+        raw_tensor.resize(double_tensor.size() * sizeof(uint64_t));
+        uint64_t* raw_ptr = reinterpret_cast<uint64_t*>(raw_tensor.data());
+        for (size_t i = 0; i < double_tensor.size(); ++i) {
+          raw_ptr[i] = static_cast<uint64_t>(double_tensor[i]);
+        }
+        break;
+      }
+      case QNN_DATATYPE_FLOAT_32: {
+        raw_tensor.resize(double_tensor.size() * sizeof(float));
+        float* raw_ptr = reinterpret_cast<float*>(raw_tensor.data());
+        for (size_t i = 0; i < double_tensor.size(); ++i) {
+          raw_ptr[i] = static_cast<float>(double_tensor[i]);
+        }
+        break;
+      }
+      case QNN_DATATYPE_FLOAT_16: {
+        raw_tensor.resize(double_tensor.size() * sizeof(Ort::Float16_t));
+        Ort::Float16_t* raw_ptr = reinterpret_cast<Ort::Float16_t*>(raw_tensor.data());
+        for (size_t i = 0; i < double_tensor.size(); ++i) {
+          raw_ptr[i] = Ort::Float16_t(static_cast<float>(double_tensor[i]));
+        }
+        break;
+      }
+      case QNN_DATATYPE_UFIXED_POINT_32:
+      case QNN_DATATYPE_UFIXED_POINT_16:
+      case QNN_DATATYPE_UFIXED_POINT_8:
+      case QNN_DATATYPE_SFIXED_POINT_32:
+      case QNN_DATATYPE_SFIXED_POINT_16:
+      case QNN_DATATYPE_SFIXED_POINT_8:
+      case QNN_DATATYPE_BOOL_8:
+      case QNN_DATATYPE_STRING:
+      default:
+        return MAKE_EP_FAIL(("Qnn Data Type: " + std::to_string(qnn_data_type) + " is not supported yet.").c_str());
+    }
+    return Ort::Status();
+  }
+
+  // Maybe dequantizes a 1D BatchNorm parameter tensor to double values.
+  Ort::Status MaybeDequantizeParamTensor(const TensorInfo& info,
+                                         const uint8_t* raw_ptr,
+                                         const size_t raw_ptr_length,
+                                         std::string_view tensor_name,
+                                         std::vector<double>& out) const {
+    uint32_t channel = info.shape[0];
+    out.resize(channel);
+    RETURN_IF_ERROR(AssertUnpackedTensorSize(info.qnn_data_type, channel, raw_ptr_length));
+
+    const bool is_quantized = info.quant_param.IsQuantized();
+    const bool is_per_channel = info.quant_param.IsPerChannel();
+    const Qnn_QuantizeParams_t& quant_param = info.quant_param.Get();
+    if (is_per_channel) {
+      // Validate per-channel quantization parameters for 1D BatchNorm tensors.
+      // For 1D tensors, axis must be 0 and numScaleOffsets must equal channel count.
+      RETURN_IF_NOT(quant_param.axisScaleOffsetEncoding.axis == 0,
+                    ("Per-channel quantization axis must be 0 for 1D " + std::string(tensor_name) + " tensor, got " +
+                     std::to_string(quant_param.axisScaleOffsetEncoding.axis))
+                        .c_str());
+      RETURN_IF_NOT(quant_param.axisScaleOffsetEncoding.numScaleOffsets == channel,
+                    ("Per-channel quantization scale/offset count (" +
+                     std::to_string(quant_param.axisScaleOffsetEncoding.numScaleOffsets) +
+                     ") must equal channel count (" + std::to_string(channel) + ") for " + std::string(tensor_name) +
+                     " tensor.")
+                        .c_str());
+    }
+
+    int offset = 0;
+    for (uint32_t i = 0; i < channel; ++i) {
+      double value = 0.0;
+      RETURN_IF_ERROR(GetValueOnQnnDataType(info.qnn_data_type, raw_ptr + offset, value, offset));
+      // Dequantize if needed
+      if (is_quantized) {
+        if (is_per_channel) {
+          value = utils::Dequantize(quant_param.axisScaleOffsetEncoding.scaleOffset[i].offset,
+                                    quant_param.axisScaleOffsetEncoding.scaleOffset[i].scale,
+                                    value);
+        } else {
+          value = utils::Dequantize(quant_param.scaleOffsetEncoding.offset,
+                                    quant_param.scaleOffsetEncoding.scale,
+                                    value);
+        }
+      }
+      out[i] = value;
+    }
+    return Ort::Status();
+  }
+
+  Ort::Status PreprocessMean(const TensorInfo& mean_info,
+                             const uint8_t* mean_raw_ptr,
+                             const size_t mean_raw_ptr_length,
+                             std::vector<double>& mean_out) const {
+    return MaybeDequantizeParamTensor(mean_info, mean_raw_ptr, mean_raw_ptr_length, "mean", mean_out);
+  }
+
+  Ort::Status PreprocessStd(const TensorInfo& var_info,
+                            const uint8_t* var_raw_ptr,
+                            const size_t var_raw_ptr_length,
+                            const float epsilon,
+                            std::vector<double>& std_out) const {
+    std::vector<double> var_dequantized;
+    RETURN_IF_ERROR(MaybeDequantizeParamTensor(var_info, var_raw_ptr, var_raw_ptr_length, "variance", var_dequantized));
+
+    std_out.resize(var_dequantized.size());
+    for (size_t i = 0; i < var_dequantized.size(); ++i) {
+      std_out[i] = std::sqrt(var_dequantized[i] + static_cast<double>(epsilon));
+    }
+    return Ort::Status();
+  }
+
+  Ort::Status PreprocessScale(const TensorInfo& scale_info,
+                              const uint8_t* scale_raw_ptr,
+                              const size_t scale_raw_ptr_length,
+                              const std::vector<double>& std_double_tensor,
+                              double& rmax,
+                              double& rmin,
+                              std::vector<double>& scale_out) const {
+    RETURN_IF_ERROR(MaybeDequantizeParamTensor(scale_info, scale_raw_ptr, scale_raw_ptr_length, "scale", scale_out));
+
+    for (size_t i = 0; i < scale_out.size(); ++i) {
+      scale_out[i] /= std_double_tensor[i];
+      rmax = std::max(rmax, scale_out[i]);
+      rmin = std::min(rmin, scale_out[i]);
+    }
+    return Ort::Status();
+  }
+
+  Ort::Status PreprocessBias(const TensorInfo& bias_info,
+                             const uint8_t* bias_raw_ptr,
+                             const size_t bias_raw_ptr_length,
+                             const std::vector<double>& scale_double_tensor,
+                             const std::vector<double>& mean_double_tensor,
+                             double& rmax,
+                             double& rmin,
+                             std::vector<double>& bias_out) const {
+    RETURN_IF_ERROR(MaybeDequantizeParamTensor(bias_info, bias_raw_ptr, bias_raw_ptr_length, "bias", bias_out));
+
+    for (size_t i = 0; i < bias_out.size(); ++i) {
+      bias_out[i] -= mean_double_tensor[i] * scale_double_tensor[i];
+      rmax = std::max(rmax, bias_out[i]);
+      rmin = std::min(rmin, bias_out[i]);
+    }
+    return Ort::Status();
+  }
+
+  Ort::Status Postprocess(const TensorInfo& info,
+                          const std::vector<double>& double_tensor,
+                          const double rmax,
+                          const double rmin,
+                          QnnQuantParamsWrapper& quant_param,
+                          std::vector<uint8_t>& raw_tensor) const {
+    bool symmetric = false;
+    if (info.quant_param.IsQuantized()) {
+      size_t data_size = double_tensor.size();
+      // QNN BatchNorm requires symmetric quantization (zero_point=0) for signed params
+      if (info.qnn_data_type == QNN_DATATYPE_SFIXED_POINT_32) {
+        data_size *= sizeof(int32_t);
+        symmetric = true;
+      } else if (info.qnn_data_type == QNN_DATATYPE_SFIXED_POINT_16) {
+        data_size *= sizeof(int16_t);
+        symmetric = true;
+      } else if (info.qnn_data_type == QNN_DATATYPE_UFIXED_POINT_16) {
+        data_size *= sizeof(uint16_t);
+        symmetric = true;
+      }
+      raw_tensor.resize(data_size);
+      float scale = 0.0f;
+      int32_t zero_point = 0;
+      RETURN_IF_ERROR(utils::GetQuantParams(static_cast<float>(rmin),
+                                            static_cast<float>(rmax),
+                                            info.qnn_data_type,
+                                            scale,
+                                            zero_point,
+                                            symmetric));
+      quant_param = QnnQuantParamsWrapper::PerTensor(scale, zero_point);
+      for (size_t i = 0; i < double_tensor.size(); ++i) {
+        int quant_value_int = 0;
+        RETURN_IF_ERROR(utils::Quantize(double_tensor[i], scale, zero_point, info.qnn_data_type, quant_value_int));
+        if (info.qnn_data_type == QNN_DATATYPE_UFIXED_POINT_8) {
+          raw_tensor[i] = static_cast<uint8_t>(quant_value_int);
+        } else if (info.qnn_data_type == QNN_DATATYPE_SFIXED_POINT_8) {
+          int8_t quant_value = static_cast<int8_t>(quant_value_int);
+          raw_tensor[i] = *reinterpret_cast<uint8_t*>(&quant_value);
+        } else if (info.qnn_data_type == QNN_DATATYPE_SFIXED_POINT_16) {
+          int16_t quant_value = static_cast<int16_t>(quant_value_int);
+          size_t pos = i * sizeof(int16_t);
+          std::memcpy(&raw_tensor[pos], reinterpret_cast<uint8_t*>(&quant_value), sizeof(int16_t));
+        } else if (info.qnn_data_type == QNN_DATATYPE_UFIXED_POINT_16) {
+          uint16_t quant_value = static_cast<uint16_t>(quant_value_int);
+          size_t pos = i * sizeof(uint16_t);
+          std::memcpy(&raw_tensor[pos], reinterpret_cast<uint8_t*>(&quant_value), sizeof(uint16_t));
+        } else if (info.qnn_data_type == QNN_DATATYPE_SFIXED_POINT_32) {
+          int32_t quant_value = static_cast<int32_t>(quant_value_int);
+          size_t pos = i * sizeof(int32_t);
+          std::memcpy(&raw_tensor[pos], reinterpret_cast<uint8_t*>(&quant_value), sizeof(int32_t));
+        } else {
+          RETURN_IF(true, ("Qnn Data Type: " + std::to_string(info.qnn_data_type) + " not supported yet.").c_str());
+        }
+      }
+    } else {
+      RETURN_IF_ERROR(ConvertToRawOnQnnDataType(info.qnn_data_type, double_tensor, raw_tensor));
+    }
+    return Ort::Status();
+  }
+
+ protected:
+  Ort::Status CheckCpuDataTypes(const std::vector<Qnn_DataType_t> in_dtypes,
+                                const std::vector<Qnn_DataType_t> out_dtypes) const override ORT_MUST_USE_RESULT;
+
+  Ort::Status CheckHtpDataTypes(const std::vector<Qnn_DataType_t> in_dtypes,
+                                const std::vector<Qnn_DataType_t> out_dtypes) const override ORT_MUST_USE_RESULT;
+};
+
+namespace {
+
+// Helper to check if a BatchNorm param is constant - either direct initializer or through a DQ node.
+//
+// node_unit.GetDQNodes() is only populated for a QDQGroup-type NodeUnit. When the surrounding QDQ
+// selector rejects the group (e.g. BatchNormalizationNodeGroupSelector requires the quantized input
+// and output element types to match; mixed-bitwidth BN like u8-in/u16-out does not), BatchNorm becomes
+// a SingleNode-type NodeUnit with an empty GetDQNodes(). In that case the param's standalone DQ node
+// is visited as its own NodeUnit before BN, in topological order.
+bool IsParamConstant(const QnnModelWrapper& qnn_model_wrapper,
+                     const OrtNodeUnit& node_unit,
+                     const std::string& name) {
+  if (qnn_model_wrapper.IsConstantInput(name)) {
+    return true;
+  }
+  // Check if param comes through a DQ node with constant input (QDQGroup NodeUnit case).
+  for (const OrtNode* dq_node : node_unit.GetDQNodes()) {
+    const Ort::ConstNode const_dq_node(dq_node);
+    if (const_dq_node.GetOutputs()[0].GetName() == name) {
+      return qnn_model_wrapper.IsConstantInput(const_dq_node.GetInputs()[0].GetName());
+    }
+  }
+  return false;
+}
+
+// Adjust BatchNorm param types for QNN HTP compatibility.
+// Modifies scale/bias types in-place; quantization happens in Postprocess.
+void OverrideParamTypeForRequantize(Qnn_DataType_t x_dtype,
+                                    Qnn_DataType_t& scale_dtype,
+                                    Qnn_DataType_t& bias_dtype,
+                                    bool is_scale_has_negative_values = true) {
+  // QNN HTP with UFIXED_POINT_16 input doesn't support SFIXED_POINT_8 scale
+  if (x_dtype == QNN_DATATYPE_UFIXED_POINT_16 && scale_dtype == QNN_DATATYPE_SFIXED_POINT_8) {
+    scale_dtype = is_scale_has_negative_values ? QNN_DATATYPE_SFIXED_POINT_16 : QNN_DATATYPE_UFIXED_POINT_8;
+  }
+
+  // QNN HTP with UFIXED_POINT_8 input doesn't support SFIXED_POINT_8 scale and hence is updated to UFIXED_POINT_8
+  // This modification is going to be accuracy preserving because UFIXED_POINT_8's zero-point would be off by 2**(bw-1)
+  // when compared to SFIXED_POINT_8's zero-point, and scale factor being the same
+  if (x_dtype == QNN_DATATYPE_UFIXED_POINT_8 && scale_dtype == QNN_DATATYPE_SFIXED_POINT_8) {
+    scale_dtype = QNN_DATATYPE_UFIXED_POINT_8;
+  }
+
+  // QNN HTP requires quantized bias for quantized ops
+  bool is_quantized = (x_dtype == QNN_DATATYPE_UFIXED_POINT_8 || x_dtype == QNN_DATATYPE_SFIXED_POINT_8 ||
+                       x_dtype == QNN_DATATYPE_UFIXED_POINT_16 || x_dtype == QNN_DATATYPE_SFIXED_POINT_16);
+  if (is_quantized && (bias_dtype == QNN_DATATYPE_FLOAT_32 || bias_dtype == QNN_DATATYPE_FLOAT_16)) {
+    bias_dtype = QNN_DATATYPE_SFIXED_POINT_32;
+  }
+}
+
+// Single source of truth for float execution, shared by ProcessInputs (stores params) and
+// ProcessAttributesAndOutputs (emits the op).
+//   - has_float_output: quantized input, no output Q -> float island; BN emits float directly.
+//   - use_float_params: also covers u8/u16 input with per-channel scale, whose fused weight
+//     gamma/sqrt(var+eps) can overflow a single per-tensor requant scale.
+struct BatchNormFloatExecution {
+  bool has_float_output;
+  bool use_float_params;
+};
+
+BatchNormFloatExecution GetBatchNormFloatExecution(const TensorInfo& input_info,
+                                                   const TensorInfo& scale_info,
+                                                   const TensorInfo& output_info) {
+  const bool is_quantized_op = input_info.quant_param.IsQuantized();
+  const bool has_float_output = is_quantized_op && !output_info.quant_param.IsQuantized();
+  const bool use_float_params =
+      has_float_output ||
+      (is_quantized_op &&
+       (input_info.qnn_data_type == QNN_DATATYPE_UFIXED_POINT_8 ||
+        input_info.qnn_data_type == QNN_DATATYPE_UFIXED_POINT_16) &&
+       scale_info.quant_param.IsPerChannel());
+  return {has_float_output, use_float_params};
+}
+
+}  // namespace
+
+// BatchNorm is sensitive with data layout, no special validation so far
+// The nodes from 1st call of GetCapability do not get layout transformer applied, it's still NCHW
+// The nodes from 2nd call of GetCapability get layout transformer applied, it's NHWC
+Ort::Status BatchNormalizationOpBuilder::IsOpSupported(QnnModelWrapper& qnn_model_wrapper,
+                                                       const OrtNodeUnit& node_unit,
+                                                       const Ort::Logger& logger) const {
+  if (node_unit.Domain() == kMSInternalNHWCDomain) {
+    // It's useless to fallback the node after layout transformation because CPU EP can't support it anyway
+    // Still do it here so hopefully QNN Op validation API can tell us some details why it's not supported
+    return AddToModelBuilder(qnn_model_wrapper, node_unit, logger, true);
+  } else {
+    // Check input datatype. Can't use Qnn Op validation API since it's before layout transformation
+    RETURN_IF_ERROR(ProcessDataTypes(qnn_model_wrapper, node_unit));
+
+    const auto& inputs = node_unit.Inputs();
+    RETURN_IF_NOT(inputs.size() == 5, "5 input expected per BatchNorm Onnx Spec.");
+
+    std::vector<uint32_t> input_shape;
+    RETURN_IF_NOT(qnn_model_wrapper.GetOnnxShape(inputs[0].shape, input_shape), "Cannot get shape of input 0.");
+    const size_t input_rank = input_shape.size();
+
+    RETURN_IF(input_rank > 4, "QNN BatchNorm only supports input ranks of size <= 4.");
+
+    const uint32_t num_channels = input_shape[1];
+
+    std::vector<uint32_t> scale_shape;
+    RETURN_IF_NOT(qnn_model_wrapper.GetOnnxShape(inputs[1].shape, scale_shape), "Cannot get shape of input 1 (scale).");
+    RETURN_IF_NOT(IsParamConstant(qnn_model_wrapper, node_unit, inputs[1].name),
+                  "QNN BatchNorm doesn't support dynamic scale.");
+    RETURN_IF(scale_shape.size() != 1 || scale_shape[0] != num_channels,
+              "QNN BatchNorm input 1 (scale) must have 1D shape [channel].");
+
+    std::vector<uint32_t> bias_shape;
+    RETURN_IF_NOT(qnn_model_wrapper.GetOnnxShape(inputs[2].shape, bias_shape), "Cannot get shape of input 2 (bias).");
+    RETURN_IF_NOT(IsParamConstant(qnn_model_wrapper, node_unit, inputs[2].name),
+                  "QNN BatchNorm doesn't support dynamic bias.");
+
+    RETURN_IF(bias_shape.size() != 1 || bias_shape[0] != num_channels,
+              "QNN BatchNorm input 2 (bias) must have 1D shape [channel].");
+
+    std::vector<uint32_t> mean_shape;
+    RETURN_IF_NOT(qnn_model_wrapper.GetOnnxShape(inputs[3].shape, mean_shape), "Cannot get shape of input 3 (mean).");
+    RETURN_IF(mean_shape.size() != 1 || mean_shape[0] != num_channels,
+              "QNN BatchNorm input 3 (mean) must have 1D shape [channel].");
+    RETURN_IF_NOT(IsParamConstant(qnn_model_wrapper, node_unit, inputs[3].name),
+                  "QNN BatchNorm doesn't support dynamic mean.");
+
+    std::vector<uint32_t> var_shape;
+    RETURN_IF_NOT(qnn_model_wrapper.GetOnnxShape(inputs[4].shape, var_shape), "Cannot get shape of input 4 (var).");
+    RETURN_IF(var_shape.size() != 1 || var_shape[0] != num_channels,
+              "QNN BatchNorm input 4 (var) must have 1D shape [channel].");
+    RETURN_IF_NOT(IsParamConstant(qnn_model_wrapper, node_unit, inputs[4].name),
+                  "QNN BatchNorm doesn't support dynamic var.");
+
+    RETURN_IF(node_unit.Outputs().size() > 1, "QNN BatchNorm only support 1 output.");
+  }
+
+  return Ort::Status();
+}
+
+Ort::Status BatchNormalizationOpBuilder::ProcessInputs(QnnModelWrapper& qnn_model_wrapper,
+                                                       const OrtNodeUnit& node_unit,
+                                                       const Ort::Logger& logger,
+                                                       std::vector<std::string>& input_names,
+                                                       bool do_op_validation) const {
+  ORT_UNUSED_PARAMETER(do_op_validation);
+  ORT_UNUSED_PARAMETER(logger);
+
+  const auto& inputs = node_unit.Inputs();
+  //
+  // Input 0
+  //
+  RETURN_IF_ERROR(ProcessInput(qnn_model_wrapper, inputs[0], logger, input_names));
+
+  //
+  // Input 1: scale
+  // Input 2: bias
+  // QNN only accept 3 input. We need to first combine mean and variance into scale and bias.
+  //
+  {
+    // The fused scale/bias QNN tensors are specific to each bn node: PreprocessScale/PreprocessBias fold in
+    // this BN's mean/variance. Naming them after the source ONNX initializer (inputs[1]/inputs[2])
+    // causes a collision when two BN nodes share an initializer (e.g. AIMET-quantized models that
+    // share a saturated int32 bias init): the second node finds the name already registered, skips
+    // recompute, and silently reuses the first node's fused params. Use a per-node-unique name so
+    // each BN gets its own fused scale/bias
+    const std::string node_prefix = std::to_string(node_unit.Index()) + "_" + node_unit.Name();
+    const std::string scale_name = node_prefix + "_bn_fused_scale";
+    const std::string bias_name = node_prefix + "_bn_fused_bias";
+    TensorInfo scale_info = {};
+    TensorInfo bias_info = {};
+    TensorInfo mean_info = {};
+    TensorInfo var_info = {};
+    RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(inputs[1], scale_info));
+    RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(inputs[2], bias_info));
+    RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(inputs[3], mean_info));
+    RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(inputs[4], var_info));
+
+    // Get input tensor info to determine if this is a quantized op
+    TensorInfo input_info = {};
+    RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(inputs[0], input_info));
+    const bool is_quantized_op = input_info.quant_param.IsQuantized();
+
+    // When BN runs in float, params below are stored as f32 (see GetBatchNormFloatExecution).
+    TensorInfo output_info = {};
+    RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(node_unit.Outputs()[0], output_info));
+    const bool use_float_params = GetBatchNormFloatExecution(input_info, scale_info, output_info).use_float_params;
+
+    // Check if bias needs conversion (will be done after preprocessing)
+    const bool bias_is_float = !bias_info.quant_param.IsQuantized() &&
+                               (bias_info.qnn_data_type == QNN_DATATYPE_FLOAT_32 ||
+                                bias_info.qnn_data_type == QNN_DATATYPE_FLOAT_16);
+
+    // A param is a real ONNX initializer -- read bytes from its initializer tensor.
+    std::vector<uint8_t> scale_unpacked_tensor;
+    std::vector<uint8_t> bias_unpacked_tensor;
+    std::vector<uint8_t> mean_unpacked_tensor;
+    std::vector<uint8_t> var_unpacked_tensor;
+    RETURN_IF_ERROR(qnn_model_wrapper.UnpackInitializerData(scale_info.initializer_tensor, scale_unpacked_tensor));
+    RETURN_IF_ERROR(qnn_model_wrapper.UnpackInitializerData(bias_info.initializer_tensor, bias_unpacked_tensor));
+    RETURN_IF_ERROR(qnn_model_wrapper.UnpackInitializerData(mean_info.initializer_tensor, mean_unpacked_tensor));
+    RETURN_IF_ERROR(qnn_model_wrapper.UnpackInitializerData(var_info.initializer_tensor, var_unpacked_tensor));
+
+    std::vector<double> scale_double_tensor;
+    std::vector<double> bias_double_tensor;
+    std::vector<double> mean_double_tensor;
+    std::vector<double> std_double_tensor;
+
+    OrtNodeAttrHelper node_helper(node_unit);
+    const float epsilon = node_helper.Get("epsilon", 1e-05f);  // Default is 1e-05 according to ONNX spec.
+
+    double scale_rmax = std::numeric_limits<double>::min();
+    double scale_rmin = std::numeric_limits<double>::max();
+    double bias_rmax = std::numeric_limits<double>::min();
+    double bias_rmin = std::numeric_limits<double>::max();
+
+    // Calculate and convert new scale, new bias, mean and std to double array (may be dequantized)
+    RETURN_IF_ERROR(PreprocessMean(mean_info,
+                                   mean_unpacked_tensor.data(),
+                                   mean_unpacked_tensor.size(),
+                                   mean_double_tensor));
+    RETURN_IF_ERROR(PreprocessStd(var_info,
+                                  var_unpacked_tensor.data(),
+                                  var_unpacked_tensor.size(),
+                                  epsilon,
+                                  std_double_tensor));
+    RETURN_IF_ERROR(PreprocessScale(scale_info,
+                                    scale_unpacked_tensor.data(),
+                                    scale_unpacked_tensor.size(),
+                                    std_double_tensor,
+                                    scale_rmax,
+                                    scale_rmin,
+                                    scale_double_tensor));
+    RETURN_IF_ERROR(PreprocessBias(bias_info,
+                                   bias_unpacked_tensor.data(),
+                                   bias_unpacked_tensor.size(),
+                                   scale_double_tensor,
+                                   mean_double_tensor,
+                                   bias_rmax,
+                                   bias_rmin,
+                                   bias_double_tensor));
+
+    // Apply QNN HTP type conversions
+    OverrideParamTypeForRequantize(input_info.qnn_data_type,
+                                   scale_info.qnn_data_type,
+                                   bias_info.qnn_data_type,
+                                   scale_rmin < 0.0);
+    if (is_quantized_op && bias_is_float) {
+      bias_info.quant_param = QnnQuantParamsWrapper::PerTensor(1.0f, 0);  // Placeholder, computed in Postprocess
+    }
+
+    // use_float_params stores the fused weight/bias as F32.
+    if (!qnn_model_wrapper.IsQnnTensorWrapperExist(scale_name)) {
+      std::vector<uint8_t> scale_raw_tensor;
+      QnnQuantParamsWrapper scale_quant_param;
+      if (use_float_params) {
+        RETURN_IF_ERROR(ConvertToRawOnQnnDataType(QNN_DATATYPE_FLOAT_32, scale_double_tensor, scale_raw_tensor));
+        scale_info.qnn_data_type = QNN_DATATYPE_FLOAT_32;
+      } else {
+        scale_quant_param = scale_info.quant_param;
+        RETURN_IF_ERROR(Postprocess(scale_info,
+                                    scale_double_tensor,
+                                    scale_rmax,
+                                    scale_rmin,
+                                    scale_quant_param,
+                                    scale_raw_tensor));
+      }
+
+      // Fused scale carries raw initializer data → always STATIC
+      QnnTensorWrapper input_tensorwrapper(scale_name, QNN_TENSOR_TYPE_STATIC, scale_info.qnn_data_type,
+                                           std::move(scale_quant_param), std::move(scale_info.shape),
+                                           std::move(scale_raw_tensor));
+      RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(input_tensorwrapper)), "Failed to add tensor.");
+    }
+    input_names.push_back(scale_name);
+
+    if (!qnn_model_wrapper.IsQnnTensorWrapperExist(bias_name)) {
+      std::vector<uint8_t> bias_raw_tensor;
+      QnnQuantParamsWrapper bias_quant_param;
+      if (use_float_params) {
+        RETURN_IF_ERROR(ConvertToRawOnQnnDataType(QNN_DATATYPE_FLOAT_32, bias_double_tensor, bias_raw_tensor));
+        bias_info.qnn_data_type = QNN_DATATYPE_FLOAT_32;
+      } else {
+        bias_quant_param = bias_info.quant_param;
+        RETURN_IF_ERROR(Postprocess(bias_info,
+                                    bias_double_tensor,
+                                    bias_rmax,
+                                    bias_rmin,
+                                    bias_quant_param,
+                                    bias_raw_tensor));
+      }
+      // Fused bias carries raw initializer data → always STATIC
+      QnnTensorWrapper input_tensorwrapper(bias_name, QNN_TENSOR_TYPE_STATIC, bias_info.qnn_data_type,
+                                           std::move(bias_quant_param), std::move(bias_info.shape),
+                                           std::move(bias_raw_tensor));
+      RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(input_tensorwrapper)), "Failed to add tensor.");
+    }
+    input_names.push_back(bias_name);
+  }
+
+  return Ort::Status();
+}
+
+Ort::Status BatchNormalizationOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_model_wrapper,
+                                                                     const OrtNodeUnit& node_unit,
+                                                                     std::vector<std::string>&& input_names,
+                                                                     const Ort::Logger& logger,
+                                                                     bool do_op_validation) const {
+  if (input_names.size() < 1) {
+    return Ort::Status();
+  }
+
+  TensorInfo input_info = {};
+  RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(node_unit.Inputs()[0], input_info));
+  TensorInfo scale_info = {};
+  RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(node_unit.Inputs()[1], scale_info));
+
+  TensorInfo output_info = {};
+  RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(node_unit.Outputs()[0], output_info));
+
+  // has_float_output emits BN's float result with no trailing Quantize, feeding downstream float ops.
+  const BatchNormFloatExecution float_exec = GetBatchNormFloatExecution(input_info, scale_info, output_info);
+  const bool has_float_output = float_exec.has_float_output;
+  const bool use_float_params = float_exec.use_float_params;
+
+  if (!use_float_params) {
+    RETURN_IF_ERROR(ProcessOutputs(qnn_model_wrapper, node_unit, std::move(input_names), {},
+                                   logger, do_op_validation, GetQnnOpType(node_unit.OpType())));
+    return Ort::Status();
+  }
+
+  // Insert Dequantize (quantized -> Float_32) before BN
+  const std::string& orig_input_name = input_names[0];
+  const std::string convert_in_output = utils::UniqueNameGenerator().New(orig_input_name, "_to_f32");
+
+  std::vector<uint32_t> input_shape = input_info.shape;
+  QnnTensorWrapper convert_in_out_tensor(convert_in_output, QNN_TENSOR_TYPE_NATIVE,
+                                         QNN_DATATYPE_FLOAT_32, QnnQuantParamsWrapper(),
+                                         std::vector<uint32_t>(input_shape));
+  RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(convert_in_out_tensor)), "Failed to add tensor");
+  RETURN_IF_NOT(qnn_model_wrapper.CreateQnnNode(utils::UniqueNameGenerator().New(node_unit, "_dequant_in"),
+                                                QNN_OP_PACKAGE_NAME_QTI_AISW, QNN_OP_DEQUANTIZE,
+                                                {orig_input_name}, {convert_in_output}, {},
+                                                do_op_validation),
+                "Failed to add dequantize node");
+
+  // BN node: all float32
+  const auto& outputs = node_unit.Outputs();
+  const std::string& orig_output_name = outputs[0].name;
+  bool is_graph_output = qnn_model_wrapper.IsGraphOutput(orig_output_name);
+
+  // A float output is written directly; otherwise an intermediate feeds the trailing Quantize.
+  const std::string bn_output_name = has_float_output
+                                         ? orig_output_name
+                                         : utils::UniqueNameGenerator().New(orig_output_name, "_bn_f32");
+  Qnn_TensorType_t bn_out_tensor_type = (has_float_output && is_graph_output) ? QNN_TENSOR_TYPE_APP_READ
+                                                                              : QNN_TENSOR_TYPE_NATIVE;
+  QnnTensorWrapper bn_out_tensor(bn_output_name, bn_out_tensor_type,
+                                 QNN_DATATYPE_FLOAT_32, QnnQuantParamsWrapper(),
+                                 std::vector<uint32_t>(output_info.shape));
+  RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(bn_out_tensor)), "Failed to add tensor");
+
+  std::vector<std::string> bn_inputs = {convert_in_output, input_names[1], input_names[2]};
+  RETURN_IF_NOT(qnn_model_wrapper.CreateQnnNode(utils::UniqueNameGenerator().New(node_unit, "_bn"),
+                                                QNN_OP_PACKAGE_NAME_QTI_AISW, QNN_OP_BATCHNORM,
+                                                std::move(bn_inputs), {bn_output_name}, {},
+                                                do_op_validation),
+                "Failed to add Batchnorm node");
+
+  if (has_float_output) {
+    return Ort::Status();  // Output is the float result; downstream ops re-quantize as needed.
+  }
+
+  // Insert Quantize (Float_32 -> quantized) after BN
+  Qnn_TensorType_t out_tensor_type = is_graph_output ? QNN_TENSOR_TYPE_APP_READ : QNN_TENSOR_TYPE_NATIVE;
+  QnnTensorWrapper final_out_tensor(orig_output_name, out_tensor_type,
+                                    output_info.qnn_data_type, std::move(output_info.quant_param),
+                                    std::move(output_info.shape));
+  RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(final_out_tensor)), "Failed to add tensor");
+  RETURN_IF_NOT(qnn_model_wrapper.CreateQnnNode(utils::UniqueNameGenerator().New(node_unit, "_quant_out"),
+                                                QNN_OP_PACKAGE_NAME_QTI_AISW, QNN_OP_QUANTIZE,
+                                                {bn_output_name}, {orig_output_name}, {},
+                                                do_op_validation),
+                "Failed to add quantize node");
+
+  return Ort::Status();
+}
+
+void CreateBatchNormalizationOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations) {
+  op_registrations.AddOpBuilder(op_type, std::make_unique<BatchNormalizationOpBuilder>());
+}
+
+Ort::Status BatchNormalizationOpBuilder::CheckCpuDataTypes(const std::vector<Qnn_DataType_t> in_dtypes,
+                                                           const std::vector<Qnn_DataType_t> out_dtypes) const {
+  bool is_supported_dtype = false;
+  // in_dtypes: [X, scale, B, input_mean, input_var]
+  std::vector<Qnn_DataType_t> all_dtypes(in_dtypes.begin(), in_dtypes.begin() + 3);
+  // out_dtypes: [Y, running_mean, running_var]
+  all_dtypes.insert(all_dtypes.end(), out_dtypes.begin(), out_dtypes.begin() + 1);
+  // FP32
+  if (
+      (all_dtypes == std::vector<Qnn_DataType_t>{QNN_DATATYPE_FLOAT_32, QNN_DATATYPE_FLOAT_32, QNN_DATATYPE_FLOAT_32, QNN_DATATYPE_FLOAT_32})) {
+    is_supported_dtype = true;
+  }
+  // INT8
+  else if (
+      (all_dtypes == std::vector<Qnn_DataType_t>{QNN_DATATYPE_UFIXED_POINT_8, QNN_DATATYPE_UFIXED_POINT_8, QNN_DATATYPE_UFIXED_POINT_8, QNN_DATATYPE_UFIXED_POINT_8}) ||
+      (all_dtypes == std::vector<Qnn_DataType_t>{QNN_DATATYPE_UFIXED_POINT_8, QNN_DATATYPE_UFIXED_POINT_8, QNN_DATATYPE_SFIXED_POINT_32, QNN_DATATYPE_UFIXED_POINT_8})) {
+    is_supported_dtype = true;
+  }
+  RETURN_IF_NOT(is_supported_dtype, "QNN Batchnorm unsupported datatype on CPU.");
+  return Ort::Status();
+}
+
+Ort::Status BatchNormalizationOpBuilder::CheckHtpDataTypes(const std::vector<Qnn_DataType_t> in_dtypes,
+                                                           const std::vector<Qnn_DataType_t> out_dtypes) const {
+  bool is_supported_dtype = false;
+  // in_dtypes: [X, scale, B, input_mean, input_var]
+  // out_dtypes: [Y, running_mean, running_var]
+  Qnn_DataType_t x_dtype = in_dtypes[0];
+  Qnn_DataType_t scale_dtype = in_dtypes[1];
+  Qnn_DataType_t bias_dtype = in_dtypes[2];
+  Qnn_DataType_t y_dtype = out_dtypes[0];
+
+  // Quantized input with a float output: the input is dequantized and BN is run in float.
+  const bool x_is_quantized = (x_dtype == QNN_DATATYPE_UFIXED_POINT_8 || x_dtype == QNN_DATATYPE_SFIXED_POINT_8 ||
+                               x_dtype == QNN_DATATYPE_UFIXED_POINT_16 || x_dtype == QNN_DATATYPE_SFIXED_POINT_16);
+  if (x_is_quantized && (y_dtype == QNN_DATATYPE_FLOAT_32 || y_dtype == QNN_DATATYPE_FLOAT_16)) {
+    return Ort::Status();
+  }
+
+  // We likely need to re-quantize scale/bias for HTP compatibility, override dtypes before checking.
+  // Note: We conservatively assume scale may have negative values during validation.
+  OverrideParamTypeForRequantize(x_dtype, scale_dtype, bias_dtype);
+  std::vector<Qnn_DataType_t> all_dtypes{x_dtype, scale_dtype, bias_dtype, y_dtype};
+  // FP16/FP32
+  if (
+      (all_dtypes == std::vector<Qnn_DataType_t>{QNN_DATATYPE_FLOAT_16, QNN_DATATYPE_FLOAT_16, QNN_DATATYPE_FLOAT_16, QNN_DATATYPE_FLOAT_16}) ||
+      (all_dtypes == std::vector<Qnn_DataType_t>{QNN_DATATYPE_FLOAT_32, QNN_DATATYPE_FLOAT_32, QNN_DATATYPE_FLOAT_32, QNN_DATATYPE_FLOAT_32})) {
+    is_supported_dtype = true;
+  }
+  // INT16
+  else if (
+      (all_dtypes == std::vector<Qnn_DataType_t>{QNN_DATATYPE_UFIXED_POINT_16, QNN_DATATYPE_UFIXED_POINT_8, QNN_DATATYPE_UFIXED_POINT_8, QNN_DATATYPE_UFIXED_POINT_16}) ||
+      (all_dtypes == std::vector<Qnn_DataType_t>{QNN_DATATYPE_UFIXED_POINT_16, QNN_DATATYPE_UFIXED_POINT_8, QNN_DATATYPE_SFIXED_POINT_32, QNN_DATATYPE_UFIXED_POINT_16}) ||
+      (all_dtypes == std::vector<Qnn_DataType_t>{QNN_DATATYPE_UFIXED_POINT_16, QNN_DATATYPE_UFIXED_POINT_16, QNN_DATATYPE_UFIXED_POINT_8, QNN_DATATYPE_UFIXED_POINT_16}) ||
+      (all_dtypes == std::vector<Qnn_DataType_t>{QNN_DATATYPE_UFIXED_POINT_16, QNN_DATATYPE_UFIXED_POINT_16, QNN_DATATYPE_SFIXED_POINT_32, QNN_DATATYPE_UFIXED_POINT_16}) ||
+      (all_dtypes == std::vector<Qnn_DataType_t>{QNN_DATATYPE_UFIXED_POINT_16, QNN_DATATYPE_SFIXED_POINT_16, QNN_DATATYPE_UFIXED_POINT_8, QNN_DATATYPE_UFIXED_POINT_16}) ||
+      (all_dtypes == std::vector<Qnn_DataType_t>{QNN_DATATYPE_UFIXED_POINT_16, QNN_DATATYPE_SFIXED_POINT_16, QNN_DATATYPE_SFIXED_POINT_32, QNN_DATATYPE_UFIXED_POINT_16})) {
+    is_supported_dtype = true;
+  }
+  // INT8
+  else if (
+      (all_dtypes == std::vector<Qnn_DataType_t>{QNN_DATATYPE_UFIXED_POINT_8, QNN_DATATYPE_UFIXED_POINT_8, QNN_DATATYPE_UFIXED_POINT_8, QNN_DATATYPE_UFIXED_POINT_8}) ||
+      (all_dtypes == std::vector<Qnn_DataType_t>{QNN_DATATYPE_UFIXED_POINT_8, QNN_DATATYPE_UFIXED_POINT_8, QNN_DATATYPE_SFIXED_POINT_32, QNN_DATATYPE_UFIXED_POINT_8}) ||
+      (all_dtypes == std::vector<Qnn_DataType_t>{QNN_DATATYPE_SFIXED_POINT_8, QNN_DATATYPE_SFIXED_POINT_8, QNN_DATATYPE_SFIXED_POINT_8, QNN_DATATYPE_SFIXED_POINT_8})) {
+    is_supported_dtype = true;
+  }
+  RETURN_IF_NOT(is_supported_dtype, "QNN Batchnorm unsupported datatype on HTP.");
+  return Ort::Status();
+}
+
+}  // namespace qnn
+}  // namespace onnxruntime

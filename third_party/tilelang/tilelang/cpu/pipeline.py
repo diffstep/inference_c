@@ -1,0 +1,92 @@
+from __future__ import annotations
+
+from tvm import IRModule, s_tir, tirx
+from tvm.target import Target
+
+import tilelang
+from tilelang.backend.pass_pipeline.pipeline_utils import (
+    LayoutVisual,
+    allow_vectorize,
+    should_enable_race_check,
+    should_force_let_inline,
+)
+
+
+def CPUPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
+    mod = tirx.transform.BindTarget(target)(mod)
+    mod = tilelang.transform.MaterializeKernelLaunch(lower_thread_binding=False, unsupported_annotations=["cluster_dims"])(mod)
+    pass_ctx = tilelang.transform.get_pass_context()
+
+    if should_force_let_inline():
+        mod = tilelang.transform.LetInline()(mod)
+    mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
+    mod = tilelang.transform.LegalizeNegativeIndex()(mod)
+    if should_enable_race_check():
+        mod = tilelang.transform.VerifyParallelLoop()(mod)
+    mod = tilelang.transform.InjectAssumes()(mod)
+    mod = tilelang.transform.Simplify()(mod)
+    mod = tilelang.transform.CanonicalizeLegacyReducer()(mod)
+    mod = tilelang.transform.VerifyReducerEpoch()(mod)
+    # Warn on buffers that are read before anything writes them.
+    # Runs after the reducer passes above, so legacy reducers have been
+    # canonicalized, and before PipelinePlanning and LowerTileOp, while
+    # loop bodies are still in source order and tile ops still declare
+    # their access regions.
+    mod = tilelang.transform.VerifyBufferInit()(mod)
+
+    mod = tilelang.transform.IfStmtBinding()(mod)
+    mod = tilelang.transform.Simplify()(mod)
+
+    mod = tilelang.transform.LayoutInference()(mod)
+    mod = tilelang.transform.ReducerPlanAndMaterialize()(mod)
+    LayoutVisual(mod)
+    mod = tilelang.transform.LowerTileOp()(mod)
+    mod = tilelang.transform.VerifyReducerConsumed()(mod)
+    # Scalar-path atomic intrinsics (tl.atomic_*_elem_op) survive LowerTileOp;
+    # rewrite them to plain serial RMW before vectorization/legalization so
+    # that both the `c` and `llvm` codegens only see BufferLoad/BufferStore.
+    mod = tilelang.cpu.transform.LowerCPUAtomics()(mod)
+
+    mod = tilelang.transform.DecoupleTypeCast()(mod)
+    mod = tilelang.transform.LegalizeVectorizedLoop()(mod)
+    mod = tilelang.transform.LegalizeSafeMemoryAccess()(mod)
+    mod = tilelang.transform.LowerAccessPtr()(mod)
+    mod = tilelang.transform.Simplify()(mod)
+    mod = tilelang.transform.HoistNonRestrictParams()(mod)
+
+    mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
+    mod = tilelang.transform.HoistGlobalBufferAllocations()(mod)
+    mod = tilelang.transform.LowerOpaqueBlock()(mod)
+    mod = tilelang.transform.Simplify()(mod)
+    mod = tirx.transform.NarrowDataType(32)(mod)
+    mod = tilelang.transform.FlattenBuffer()(mod)
+    # The CPU codegens have no native BF16. Host codegen legalizes BF16 storage
+    # to uint16, which requires BF16 arithmetic to have been legalized first;
+    # this is the point TVM's default pipeline runs it.
+    mod = tirx.transform.BF16ComputeLegalize()(mod)
+    mod = tilelang.transform.ConfigIndexBitwidth()(mod)
+    mod = tirx.transform.Simplify()(mod)
+    mod = tilelang.transform.VectorizeLoop(enable_vectorize=allow_vectorize(pass_ctx=pass_ctx))(mod)
+    mod = tilelang.transform.StorageRewrite()(mod)
+    mod = tilelang.transform.LoopUnswitching()(mod)
+    mod = tilelang.transform.UnrollLoop()(mod)
+    mod = s_tir.transform.RenormalizeSplitPattern()(mod)
+    mod = tirx.transform.Simplify()(mod)
+    mod = tirx.transform.RemoveNoOp()(mod)
+    mod = s_tir.transform.HoistIfThenElse()(mod)
+
+    mod = tirx.transform.VerifyMemory()(mod)
+    mod = tirx.transform.AnnotateEntryFunc()(mod)
+    mod = s_tir.transform.InferFragment()(mod)
+    # CPU currently skips LowerThreadAllreduce because thread bindings are lowered
+    # as serial loops. Revisit this if CPU gains thread-level reduce/allreduce support.
+
+    mod = tilelang.transform.AnnotateDeviceRegions()(mod)
+    mod = tilelang.transform.SplitHostDevice()(mod)
+    mod = tilelang.transform.AnnotateReadOnlyParams()(mod)
+
+    mod = tilelang.transform.MergeIfStmt()(mod)
+    mod = tilelang.transform.MakePackedAPI()(mod)
+    mod = tilelang.transform.Simplify()(mod)
+    mod = tilelang.transform.LowerDeviceKernelLaunch()(mod)
+    return mod

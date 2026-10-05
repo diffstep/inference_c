@@ -1,0 +1,25 @@
+[package]
+name = "fast-reasoning"
+version = "0.1.0"
+edition = "2021"
+description = "A small, inspectable inference engine for local Hugging Face models"
+
+[dependencies]
+candle-core = { version = "0.9.1", features = ["metal"] }
+candle-nn = "0.9.1"
+candle-metal-kernels = "0.9.2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+memmap2 = "0.9.11"
+safetensors = "0.8.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = "0.23.2"
+
+[build-dependencies]
+cc = "1.4.7"
+
+[patch.crates-io]
+candle-metal-kernels = { path = "vendor/candle-metal-kernels" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-metal = "0.3.2"

@@ -1,0 +1,8 @@
+api:CSharp: '/(\bc\s*sharp\b|\bc#)/i'
+api:java: '/\bjava\b/i'
+api:javascript: '/\bjavascript\b/i'
+.NET: '/(\bdot\s*net\b|\bnuget\b|\.net\b)/i'
+platform:jetson: '/(\bjetson\b|\bjetpack\b)/i'
+platform:mobile: '/(\bobj(?:ective)?-?c\b|\bnnapi\b|\bmobile\b|\bandroid\b|\bios\b|\bxamarin\b|\bmaui\b)/i'
+platform:web: '/(\bwebgl\b|\bweb-?gpu\b|\bwasm\b|\bonnxruntime-node\b|\bonnxruntime-web\b|\bonnxruntime-react-native\b|\bnpm\b|\btransformers\.js\b)/i'
+model:transformer: '/\btransformers(?!\.js)\b/i'

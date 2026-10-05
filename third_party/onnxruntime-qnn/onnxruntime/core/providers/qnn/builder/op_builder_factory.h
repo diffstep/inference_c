@@ -1,0 +1,131 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#pragma once
+
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "core/providers/qnn/builder/op_builder.h"
+#include "core/providers/qnn/ort_api.h"
+
+namespace onnxruntime {
+namespace qnn {
+
+class OpBuilderRegistrations {
+ public:
+  OpBuilderRegistrations();
+  ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(OpBuilderRegistrations);
+
+  const IOpBuilder* GetOpBuilderByOnnxOpType(const std::string& onnx_op_type) const {
+    auto pos = op_builder_map_.find(onnx_op_type);
+    if (pos != op_builder_map_.end()) {
+      return pos->second;
+    }
+
+    return nullptr;
+  }
+
+  void AddOpBuilder(const std::string& onnx_op_type, std::unique_ptr<IOpBuilder> builder) {
+    if (GetOpBuilderByOnnxOpType(onnx_op_type) != nullptr) {  // already have this Op added
+      return;
+    }
+
+    auto builder_type = builder->GetOpBuilderType();
+    auto pos_in_builder_type_map = builder_type_builder_map_.find(builder_type);
+    if (pos_in_builder_type_map != builder_type_builder_map_.end()) {
+      // already have this builder type, re-use it for this onnx_op_type
+      op_builder_map_.emplace(onnx_op_type, pos_in_builder_type_map->second);
+    } else {
+      // New Op builder, add to vector and all the maps
+      builders_.push_back(std::move(builder));
+      op_builder_map_.emplace(onnx_op_type, builders_.back().get());
+      builder_type_builder_map_.emplace(builder_type, builders_.back().get());
+    }
+  }
+
+ private:
+  std::vector<std::unique_ptr<IOpBuilder>> builders_;
+  // <onnx_op_type, IOpBuilder*>
+  std::unordered_map<std::string, const IOpBuilder*> op_builder_map_;
+  // <Op_builder_type, IOpBuilder*>
+  std::unordered_map<std::string, const IOpBuilder*> builder_type_builder_map_;
+};
+
+const IOpBuilder* GetOpBuilder(const std::string& onnx_op_type);
+
+void CreateArgMaxMinOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateArrayFeatureExtractorOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateAttentionOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateBatchNormalizationOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateBernoulliOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateCastOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateClipOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateConcatOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateConvOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateCumSumOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateEinsumOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateExpandOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateFusedMatMulOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateGatherOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateGatherBlockQuantizedOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateGatherNDOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateGemmOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateGroupNormalizationOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateGroupQueryAttentionOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateGRUOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateHardSigmoidOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateIdentityOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateIfOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateInstanceNormalizationOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateInverseOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateIsInfOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateIsNaNOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateLayerNormalizationOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateLpPoolOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateLRNOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateLSTMOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateMatMulOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateMatMulNBitsOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateMaxRoiPoolOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateMeanOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateModOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateNonMaxSuppressionOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateNonZeroOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateOneHotOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreatePadOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreatePoolOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateQLinearConvOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateQLinearMatMulOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateQuickGeluOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateRandomNormalLikeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateRandomUniformLikeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateRangeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateReciprocalOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateReduceOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateReshapeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateResizeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateRMSNormalizationOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateRoiAlignOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateRotaryEmbeddingOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateScatterElementsOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateScatterNDOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateSeluOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateShapeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateSimpleOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateSliceOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateSoftmaxOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateSplitOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateSTFTOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateTanOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateThresholdedReluOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateTileOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateTopKOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateTransposeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateUpsampleOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+
+}  // namespace qnn
+}  // namespace onnxruntime

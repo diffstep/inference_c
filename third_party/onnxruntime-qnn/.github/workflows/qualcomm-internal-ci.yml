@@ -1,0 +1,49 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: MIT
+
+name: Qualcomm Internal PR Workflow
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+on:
+  push:
+    branches: [main, rel-*, rel/**/*]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main, rel-*, rel/**/*]
+  merge_group:
+    types: [checks_requested]
+
+  # Allow this workflow to be run manually from the Actions tab
+  workflow_dispatch:
+
+# only one active job per PR. this will cause jobs to be immediately cancelled on subsequent pushes in PRs.
+# ref: https://docs.github.com/en/actions/using-jobs/using-concurrency#example-using-a-fallback-value
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test-all:
+    name: Build & Test
+    # Draft PRs don't auto-trigger CI: push to a draft runs nothing. CI fires when the PR is
+    # marked ready-for-review, or on manual workflow_dispatch. Drafts can't merge, so skipping
+    # their (required) checks blocks nothing. Non-PR events (push/merge_group/dispatch) always run.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    uses: ./.github/workflows/qualcomm-internal-build-and-test.yml
+    secrets: inherit
+    with:
+      do_all: true
+
+  coverage:
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == false }}
+    uses: ./.github/workflows/qualcomm-internal-coverage.yml
+    secrets: inherit
+
+  asan:
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == false }}
+    uses: ./.github/workflows/qualcomm-internal-asan.yml
+    secrets: inherit
